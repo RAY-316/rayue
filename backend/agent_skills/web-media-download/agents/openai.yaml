@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Media Download"
+  short_description: "Download authorized public video, audio, subtitles, and thumbnails."
+  default_prompt: "Use $web-media-download to download or extract the requested public online media."

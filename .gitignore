@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+*.tsbuildinfo
+dist/
+build/
+*.log
+storage/

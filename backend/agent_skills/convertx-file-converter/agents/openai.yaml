@@ -1,0 +1,4 @@
+interface:
+  display_name: "ConvertX File Converter"
+  short_description: "Convert files through Rayue's local ConvertX service."
+  default_prompt: "Convert this file to the requested format using the local ConvertX service."

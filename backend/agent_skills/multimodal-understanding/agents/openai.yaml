@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multimodal Understanding"
+  short_description: "Analyze video, audio, images, and PDFs"
+  default_prompt: "Use $multimodal-understanding to analyze this uploaded video or other multimodal file."

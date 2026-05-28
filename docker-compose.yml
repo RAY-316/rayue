@@ -1,0 +1,23 @@
+name: rayue-agent
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rayue_agent
+      POSTGRES_USER: rayue_agent
+      POSTGRES_PASSWORD: rayue_agent
+    ports:
+      - "55432:5432"
+    volumes:
+      - rayue_agent_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rayue_agent -d rayue_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  rayue_agent_pg:
+    external: true
+    name: rayue-agent_rayue_agent_pg

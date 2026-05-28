@@ -1,0 +1,10 @@
+asyncpg==0.30.0
+e2b==2.23.1
+fastapi==0.116.2
+httpx==0.28.1
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20
+SQLAlchemy==2.0.37
+tomli-w==1.2.0
+uvicorn[standard]==0.32.1
