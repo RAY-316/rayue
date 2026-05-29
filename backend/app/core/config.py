@@ -2,6 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import AliasChoices
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -44,10 +45,32 @@ class Settings(BaseSettings):
     upload_storage_dir: Path = PROJECT_ROOT / "storage" / "uploads"
     upload_bundle_dir: Path = PROJECT_ROOT / "storage" / "upload-bundles"
     sandbox_inputs_dir: str = "inputs"
-    max_upload_file_bytes: int = 50 * 1024 * 1024
+    max_upload_file_bytes: int = 150 * 1024 * 1024
     max_upload_files_per_request: int = 10
     artifact_storage_dir: Path = PROJECT_ROOT / "storage" / "artifacts"
-    max_artifact_bytes: int = 100 * 1024 * 1024
+    max_artifact_bytes: int = 1024 * 1024 * 1024
+    s3_bucket: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAYUE_S3_BUCKET", "XPET_S3_BUCKET", "S3_BUCKET"),
+    )
+    s3_region: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("RAYUE_S3_REGION", "XPET_S3_REGION", "S3_REGION"),
+    )
+    s3_endpoint: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAYUE_S3_ENDPOINT", "XPET_S3_ENDPOINT", "S3_ENDPOINT"),
+    )
+    s3_access_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAYUE_S3_ACCESS_KEY", "XPET_S3_ACCESS_KEY", "S3_ACCESS_KEY"),
+    )
+    s3_secret_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAYUE_S3_SECRET_KEY", "XPET_S3_SECRET_KEY", "S3_SECRET_KEY"),
+    )
+    object_storage_prefix: str = "rayue-agent"
+    object_storage_presign_seconds: int = 3600
     log_codex_raw_events: bool = False
 
 

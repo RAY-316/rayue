@@ -28,10 +28,14 @@ from app.domain.models import Conversation
 from app.domain.models import Message
 from app.domain.models import utcnow
 from app.domain.schemas import ArtifactOut
+from app.files.object_storage import build_object_storage
+from app.files.object_storage import content_type_for_path
+from app.files.object_storage import conversation_object_key
 from app.files.uploads import INPUT_MARKER_NAME
 from app.files.uploads import build_upload_bundle
 from app.files.uploads import is_uploaded_input_path
 from app.files.uploads import render_upload_context
+from app.files.uploads import resolve_uploaded_file_path
 
 
 class AgentRuntimeError(RuntimeError):
@@ -57,6 +61,7 @@ class ArtifactBundle:
     files: tuple[ArtifactOut, ...]
 
 
+FINAL_OUTPUT_DIR = "outputs"
 ARTIFACT_EXTENSIONS = (
     ".pptx",
     ".pdf",
@@ -100,6 +105,42 @@ ARTIFACT_PRIORITY_EXTENSIONS = (
     ".gif",
     ".webp",
 )
+OBJECT_DOWNLOAD_SCRIPT = r"""
+import json
+from pathlib import Path
+import shutil
+import sys
+import urllib.request
+
+
+def assert_under_workspace(workspace: Path, path: Path) -> Path:
+    resolved = path.resolve()
+    if workspace != resolved and workspace not in resolved.parents:
+        raise RuntimeError(f"path escapes workspace: {path}")
+    return resolved
+
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+workspace = Path(manifest["workspace"]).resolve()
+reset_dir = manifest.get("resetDir")
+if reset_dir:
+    shutil.rmtree(assert_under_workspace(workspace, Path(reset_dir)), ignore_errors=True)
+
+for item in manifest["files"]:
+    destination = assert_under_workspace(workspace, Path(item["path"]))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(item["url"], timeout=300) as response:
+        with destination.open("wb") as output:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
+    expected_size = item.get("size")
+    if expected_size is not None and destination.stat().st_size != expected_size:
+        raise RuntimeError(f"download size mismatch: {destination}")
+
+marker = Path(manifest["markerPath"])
+marker.parent.mkdir(parents=True, exist_ok=True)
+marker.write_text(manifest["markerHash"], encoding="utf-8")
+print(f"downloaded {len(manifest['files'])} files from object storage")
+"""
 ARTIFACT_EXCLUDED_DIRS = frozenset(
     {
         ".cache",
@@ -114,6 +155,7 @@ ARTIFACT_EXCLUDED_DIRS = frozenset(
         "__pycache__",
         "env",
         "node_modules",
+        "unpacked",
         "venv",
     }
 )
@@ -322,8 +364,11 @@ class AgentRuntime:
             await worker.sync_uploaded_files()
 
     async def stop_turn(self, conversation_id: str) -> None:
-        self._stop_requests.add(conversation_id)
         worker = self._workers.get(conversation_id)
+        if worker is not None and worker.active_turn_completed:
+            return
+
+        self._stop_requests.add(conversation_id)
         task = self._turn_tasks.get(conversation_id)
         if (worker is None or worker.closed) and (task is None or task.done()):
             await self._set_conversation_status(conversation_id, "stopping")
@@ -337,7 +382,7 @@ class AgentRuntime:
     async def _stop_turn_background(self, conversation_id: str) -> None:
         worker = self._workers.get(conversation_id)
         try:
-            if worker is not None and not worker.closed:
+            if worker is not None and not worker.closed and not worker.active_turn_completed:
                 await worker.interrupt_current_turn()
         except AgentTurnInterrupted:
             pass
@@ -513,6 +558,8 @@ class AgentRuntime:
         local_path = self._resolve_local_artifact_path(conversation_id, path)
         if local_path.exists() and local_path.is_file():
             return local_path.read_bytes(), local_path.name
+        if not _is_final_output_artifact(self._workspace_relative_path(path)):
+            raise AgentRuntimeError("Only final output files are downloadable")
         worker = await self._artifact_worker(conversation_id)
         return await worker.read_artifact(path)
 
@@ -720,10 +767,11 @@ class AgentRuntime:
 
     def _list_local_artifacts(self, conversation_id: str) -> list[ArtifactOut]:
         root = self._local_artifact_root(conversation_id)
-        if not root.exists():
+        outputs_root = root / FINAL_OUTPUT_DIR
+        if not outputs_root.exists():
             return []
         artifacts: list[ArtifactOut] = []
-        for dirpath, dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(outputs_root):
             dirnames[:] = [
                 dirname
                 for dirname in dirnames
@@ -731,7 +779,9 @@ class AgentRuntime:
             ]
             for filename in filenames:
                 path = Path(dirpath) / filename
-                relative_path = path.relative_to(root).as_posix()
+                relative_path = str(
+                    PurePosixPath(FINAL_OUTPUT_DIR) / path.relative_to(outputs_root).as_posix()
+                )
                 if not self._is_downloadable_artifact(relative_path):
                     continue
                 stat = path.stat()
@@ -772,7 +822,7 @@ class AgentRuntime:
         return is_uploaded_input_path(self.settings, relative)
 
     def _is_downloadable_artifact(self, relative_path: str) -> bool:
-        return _is_candidate_artifact(relative_path) and not is_uploaded_input_path(
+        return _is_final_output_artifact(relative_path) and not is_uploaded_input_path(
             self.settings,
             relative_path,
         )
@@ -795,20 +845,10 @@ class AgentRuntime:
         if not files:
             return None
 
-        digest = hashlib.sha256()
-        byte_count = 0
-        for artifact in files:
-            local_path = self._resolve_local_artifact_path(
-                conversation_id,
-                artifact.relative_path,
-            )
-            digest.update(artifact.relative_path.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(_file_sha256(local_path))
-            digest.update(b"\0")
-            byte_count += artifact.size
-
-        sha256 = digest.hexdigest()
+        fingerprint = self._artifact_fingerprint(conversation_id, files)
+        if fingerprint is None:
+            return None
+        sha256, byte_count = fingerprint
         root = self._local_artifact_root(conversation_id)
         bundle_root = root / ".rayue-bundles"
         bundle_root.mkdir(parents=True, exist_ok=True)
@@ -837,6 +877,30 @@ class AgentRuntime:
             files=files,
         )
 
+    def _artifact_fingerprint(
+        self,
+        conversation_id: str,
+        files: tuple[ArtifactOut, ...] | None = None,
+    ) -> tuple[str, int] | None:
+        if files is None:
+            files = tuple(self._list_local_artifacts(conversation_id))
+        if not files:
+            return None
+
+        digest = hashlib.sha256()
+        byte_count = 0
+        for artifact in files:
+            local_path = self._resolve_local_artifact_path(
+                conversation_id,
+                artifact.relative_path,
+            )
+            digest.update(artifact.relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(_file_sha256(local_path))
+            digest.update(b"\0")
+            byte_count += artifact.size
+        return digest.hexdigest(), byte_count
+
     def _render_artifact_context(self, conversation_id: str) -> str:
         files = self._list_local_artifacts(conversation_id)
         if not files:
@@ -846,9 +910,10 @@ class AgentRuntime:
         lines = [
             "",
             "",
-            "Generated files from previous turns are available in the current workspace root.",
-            "Use these conversation outputs when the user refers to prior generated files.",
-            "Generated file paths:",
+            f"Final output files from previous turns are available under `{FINAL_OUTPUT_DIR}/`.",
+            "Use these outputs when the user refers to prior generated files.",
+            f"Keep intermediate work under `work/` or `tmp/`; only final deliverables in `{FINAL_OUTPUT_DIR}/` are saved for the user.",
+            "Final output file paths:",
         ]
         for file in shown_files:
             lines.append(f"- `{file.relative_path}` ({_format_bytes(file.size)})")
@@ -1089,6 +1154,10 @@ class BaseConversationWorker:
     def has_active_turn(self) -> bool:
         return False
 
+    @property
+    def active_turn_completed(self) -> bool:
+        return False
+
     async def list_artifacts(self) -> list[ArtifactOut]:
         raise AgentRuntimeError("Artifacts are not available in this run mode")
 
@@ -1160,6 +1229,10 @@ class CodexAppServerWorker(BaseConversationWorker):
     def has_active_turn(self) -> bool:
         return self._active_turn_id is not None
 
+    @property
+    def active_turn_completed(self) -> bool:
+        return self._active_turn_id is not None and self._active_turn_id in self._completed_turns
+
     async def send_message(self, content: str) -> None:
         self.touch()
         await self._ensure_started()
@@ -1175,6 +1248,7 @@ class CodexAppServerWorker(BaseConversationWorker):
         self._raise_if_interrupted()
         assert self.thread_id is not None
         assert self.workspace is not None
+        content = content + self._render_output_contract()
         result = await self._request(
             "turn/start",
             {
@@ -1332,16 +1406,19 @@ class CodexAppServerWorker(BaseConversationWorker):
             self.sandbox = None
 
     async def interrupt_current_turn(self) -> None:
+        turn_id = self._active_turn_id
+        if turn_id is not None and turn_id in self._completed_turns:
+            return
+
         self._interrupt_requested = True
         if self.command_handle is None or self.sandbox is None or self.thread_id is None:
             await self.close()
             raise AgentTurnInterrupted()
 
-        turn_id = self._active_turn_id or ""
         try:
             await self._request(
                 "turn/interrupt",
-                {"threadId": self.thread_id, "turnId": turn_id},
+                {"threadId": self.thread_id, "turnId": turn_id or ""},
                 timeout=TURN_INTERRUPT_TIMEOUT_SECONDS,
             )
         except CodexRpcError as exc:
@@ -1391,6 +1468,8 @@ class CodexAppServerWorker(BaseConversationWorker):
             relative_path = entry.get("relative_path")
             if not isinstance(relative_path, str) or not _is_candidate_artifact(relative_path):
                 continue
+            if not _is_final_output_artifact(relative_path):
+                continue
             if is_uploaded_input_path(self.runtime.settings, relative_path):
                 continue
             artifacts.append(
@@ -1425,6 +1504,7 @@ class CodexAppServerWorker(BaseConversationWorker):
         artifacts = await self.list_artifacts()
         root = self.runtime._local_artifact_root(self.conversation_id)
         root.mkdir(parents=True, exist_ok=True)
+        object_storage = build_object_storage(self.runtime.settings)
         persisted: list[ArtifactOut] = []
         for artifact in artifacts:
             if artifact.size > self.runtime.settings.max_artifact_bytes:
@@ -1437,17 +1517,45 @@ class CodexAppServerWorker(BaseConversationWorker):
             data, _filename = await self.read_artifact(artifact.path)
             destination.write_bytes(data)
             stat = destination.stat()
+            if object_storage is not None:
+                key = conversation_object_key(
+                    self.runtime.settings,
+                    self.conversation_id,
+                    "outputs",
+                    artifact.relative_path,
+                )
+                await asyncio.to_thread(
+                    object_storage.ensure_path_uploaded,
+                    key=key,
+                    path=destination,
+                    content_type=content_type_for_path(destination),
+                )
             persisted.append(
                 ArtifactOut(
                     name=destination.name,
                     path=artifact.relative_path,
                     relative_path=artifact.relative_path,
-                    type="file",
+                    type=_artifact_type(artifact.relative_path),
                     size=stat.st_size,
                     modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
                 )
             )
+        fingerprint = self.runtime._artifact_fingerprint(self.conversation_id)
+        if fingerprint is not None:
+            self._artifact_files_fingerprint = fingerprint[0]
         return sorted(persisted, key=lambda item: item.relative_path)
+
+    def _render_output_contract(self) -> str:
+        return f"""
+
+
+Output storage contract:
+- User input files live under `{self.runtime.settings.sandbox_inputs_dir}/`; treat them as read-only source material.
+- Put scratch files, extracted packages, renders, logs, thumbnails, and other intermediate work under `work/` or `tmp/`.
+- Copy only final user-facing deliverables into `{FINAL_OUTPUT_DIR}/`.
+- Rayue only saves and shows files under `{FINAL_OUTPUT_DIR}/`; anything outside it is treated as intermediate state.
+- If you modify a PPT, DOCX, XLSX, PDF, image, video, archive, or HTML file, ensure the final downloadable version is in `{FINAL_OUTPUT_DIR}/`.
+"""
 
     async def _ensure_started(self) -> None:
         if self.command_handle is not None and not self.closed:
@@ -1483,6 +1591,7 @@ class CodexAppServerWorker(BaseConversationWorker):
         self.workspace = settings.sandbox_workspace
         await self.sandbox.files.write(f"{self.codex_home}/config.toml", render_codex_config(settings))
         await self.sandbox.files.make_dir(self.workspace)
+        await self.sandbox.files.make_dir(f"{self.workspace.rstrip('/')}/{FINAL_OUTPUT_DIR}")
         await self._sync_admin_skills()
         await self._sync_uploaded_files()
 
@@ -1610,26 +1719,31 @@ class CodexAppServerWorker(BaseConversationWorker):
             'then printf yes; else printf no; fi',
             timeout=SHORT_REMOTE_COMMAND_TIMEOUT_SECONDS,
         )
+        mode = "preloaded"
         if check.stdout.strip() != "yes":
-            remote_archive_path = f"/tmp/rayue-agent-inputs-{self.conversation_id}-{bundle.sha256[:16]}.tar"
-            await self.sandbox.files.write(
-                remote_archive_path,
-                bundle.path.read_bytes(),
-                request_timeout=REMOTE_LONG_OPERATION_TIMEOUT_SECONDS,
-                use_octet_stream=True,
-            )
-            extract = await self.sandbox.commands.run(
-                "set -e; "
-                f"rm -rf {shlex.quote(input_dir)}; "
-                f"mkdir -p {shlex.quote(input_dir)}; "
-                f"tar -xf {shlex.quote(remote_archive_path)} -C {shlex.quote(input_dir)}; "
-                f"printf %s {quoted_hash} > {quoted_marker}",
-                timeout=REMOTE_LONG_OPERATION_TIMEOUT_SECONDS,
-            )
-            if extract.exit_code != 0:
-                raise AgentRuntimeError(
-                    extract.stderr or extract.error or "Failed to sync uploaded files"
+            if await self._sync_uploaded_files_from_object_storage(bundle, input_dir, marker_path):
+                mode = "object-storage"
+            else:
+                mode = "archive"
+                remote_archive_path = f"/tmp/rayue-agent-inputs-{self.conversation_id}-{bundle.sha256[:16]}.tar"
+                await self.sandbox.files.write(
+                    remote_archive_path,
+                    bundle.path.read_bytes(),
+                    request_timeout=REMOTE_LONG_OPERATION_TIMEOUT_SECONDS,
+                    use_octet_stream=True,
                 )
+                extract = await self.sandbox.commands.run(
+                    "set -e; "
+                    f"rm -rf {shlex.quote(input_dir)}; "
+                    f"mkdir -p {shlex.quote(input_dir)}; "
+                    f"tar -xf {shlex.quote(remote_archive_path)} -C {shlex.quote(input_dir)}; "
+                    f"printf %s {quoted_hash} > {quoted_marker}",
+                    timeout=REMOTE_LONG_OPERATION_TIMEOUT_SECONDS,
+                )
+                if extract.exit_code != 0:
+                    raise AgentRuntimeError(
+                        extract.stderr or extract.error or "Failed to sync uploaded files"
+                    )
 
         self._uploaded_files_fingerprint = bundle.sha256
         await self.runtime.emit(
@@ -1639,7 +1753,7 @@ class CodexAppServerWorker(BaseConversationWorker):
                 "count": bundle.file_count,
                 "bytes": bundle.byte_count,
                 "hash": bundle.sha256[:12],
-                "mode": "archive" if check.stdout.strip() != "yes" else "preloaded",
+                "mode": mode,
                 "files": [file.model_dump(mode="json") for file in bundle.files],
             },
         )
@@ -1647,6 +1761,44 @@ class CodexAppServerWorker(BaseConversationWorker):
     async def _sync_artifacts(self) -> None:
         if self.sandbox is None or self.workspace is None:
             return
+        object_storage = build_object_storage(self.runtime.settings)
+        if object_storage is not None:
+            files = tuple(self.runtime._list_local_artifacts(self.conversation_id))
+            fingerprint = self.runtime._artifact_fingerprint(self.conversation_id, files)
+            if fingerprint is not None:
+                sha256, byte_count = fingerprint
+                if sha256 == self._artifact_files_fingerprint:
+                    return
+                marker_path = f"{self.workspace.rstrip('/')}/{ARTIFACT_MARKER_NAME}"
+                quoted_marker = shlex.quote(marker_path)
+                quoted_hash = shlex.quote(sha256)
+                check = await self.sandbox.commands.run(
+                    f'if test "$(cat {quoted_marker} 2>/dev/null)" = {quoted_hash}; '
+                    'then printf yes; else printf no; fi',
+                    timeout=SHORT_REMOTE_COMMAND_TIMEOUT_SECONDS,
+                )
+                mode = "preloaded"
+                if check.stdout.strip() != "yes":
+                    await self._sync_artifacts_from_object_storage(
+                        files,
+                        marker_path,
+                        sha256,
+                    )
+                    mode = "object-storage"
+                self._artifact_files_fingerprint = sha256
+                await self.runtime.emit(
+                    self.conversation_id,
+                    "artifacts_synced",
+                    {
+                        "count": len(files),
+                        "bytes": byte_count,
+                        "hash": sha256[:12],
+                        "mode": mode,
+                        "files": [file.model_dump(mode="json") for file in files[:20]],
+                    },
+                )
+                return
+
         bundle = self.runtime._build_artifact_bundle(self.conversation_id)
         if bundle is None or bundle.sha256 == self._artifact_files_fingerprint:
             return
@@ -1695,6 +1847,136 @@ class CodexAppServerWorker(BaseConversationWorker):
                 "files": [file.model_dump(mode="json") for file in bundle.files[:20]],
             },
         )
+
+    async def _sync_uploaded_files_from_object_storage(
+        self,
+        bundle,
+        input_dir: str,
+        marker_path: str,
+    ) -> bool:
+        if self.sandbox is None or self.workspace is None:
+            return False
+        object_storage = build_object_storage(self.runtime.settings)
+        if object_storage is None:
+            return False
+
+        files: list[dict[str, Any]] = []
+        for file in bundle.files:
+            local_path = resolve_uploaded_file_path(
+                self.runtime.settings,
+                self.conversation_id,
+                file.relative_path,
+            )
+            key = conversation_object_key(
+                self.runtime.settings,
+                self.conversation_id,
+                "inputs",
+                file.relative_path,
+            )
+            await asyncio.to_thread(
+                object_storage.ensure_path_uploaded,
+                key=key,
+                path=local_path,
+                content_type=content_type_for_path(local_path),
+            )
+            url = await asyncio.to_thread(
+                object_storage.presigned_download_url,
+                key=key,
+                expires_in=self.runtime.settings.object_storage_presign_seconds,
+            )
+            files.append(
+                {
+                    "path": _resolve_workspace_path(self.workspace, file.relative_path),
+                    "url": url,
+                    "size": file.size,
+                }
+            )
+
+        await self._download_object_storage_files(
+            {
+                "workspace": self.workspace,
+                "resetDir": input_dir,
+                "markerPath": marker_path,
+                "markerHash": bundle.sha256,
+                "files": files,
+            },
+            bundle.sha256,
+        )
+        return True
+
+    async def _sync_artifacts_from_object_storage(
+        self,
+        files: tuple[ArtifactOut, ...],
+        marker_path: str,
+        marker_hash: str,
+    ) -> None:
+        assert self.workspace is not None
+        object_storage = build_object_storage(self.runtime.settings)
+        if object_storage is None:
+            raise AgentRuntimeError("Object storage is not configured")
+
+        manifest_files: list[dict[str, Any]] = []
+        for file in files:
+            local_path = self.runtime._resolve_local_artifact_path(
+                self.conversation_id,
+                file.relative_path,
+            )
+            key = conversation_object_key(
+                self.runtime.settings,
+                self.conversation_id,
+                "outputs",
+                file.relative_path,
+            )
+            await asyncio.to_thread(
+                object_storage.ensure_path_uploaded,
+                key=key,
+                path=local_path,
+                content_type=content_type_for_path(local_path),
+            )
+            url = await asyncio.to_thread(
+                object_storage.presigned_download_url,
+                key=key,
+                expires_in=self.runtime.settings.object_storage_presign_seconds,
+            )
+            manifest_files.append(
+                {
+                    "path": _resolve_workspace_path(self.workspace, file.relative_path),
+                    "url": url,
+                    "size": file.size,
+                }
+            )
+
+        await self._download_object_storage_files(
+            {
+                "workspace": self.workspace,
+                "markerPath": marker_path,
+                "markerHash": marker_hash,
+                "files": manifest_files,
+            },
+            marker_hash,
+        )
+
+    async def _download_object_storage_files(
+        self,
+        manifest: dict[str, Any],
+        marker_hash: str,
+    ) -> None:
+        assert self.sandbox is not None
+        script_path = f"/tmp/rayue-object-download-{self.conversation_id}-{marker_hash[:16]}.py"
+        manifest_path = f"/tmp/rayue-object-download-{self.conversation_id}-{marker_hash[:16]}.json"
+        await self.sandbox.files.write(script_path, OBJECT_DOWNLOAD_SCRIPT)
+        await self.sandbox.files.write(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False),
+        )
+        result = await self.sandbox.commands.run(
+            f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+            timeout=REMOTE_LONG_OPERATION_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise AgentRuntimeError(
+                result.stderr or result.error or "Failed to download files from object storage"
+            )
 
     async def _initialize(self) -> None:
         await self._request(
@@ -2118,7 +2400,8 @@ import json
 import os
 from pathlib import Path
 
-root = Path({workspace!r})
+workspace = Path({workspace!r})
+root = workspace / {FINAL_OUTPUT_DIR!r}
 excluded_dirs = set({sorted(ARTIFACT_EXCLUDED_DIRS)!r})
 excluded_files = set({sorted(ARTIFACT_EXCLUDED_FILES)!r})
 extensions = tuple({ARTIFACT_EXTENSIONS!r})
@@ -2139,7 +2422,7 @@ if root.exists():
             path = Path(dirpath) / filename
             try:
                 stat = path.stat()
-                relative_path = path.relative_to(root).as_posix()
+                relative_path = str(Path({FINAL_OUTPUT_DIR!r}) / path.relative_to(root))
             except OSError:
                 continue
             items.append({{
@@ -2170,6 +2453,15 @@ def _is_candidate_artifact(relative_path: str) -> bool:
     if name in ARTIFACT_EXCLUDED_FILES or name.startswith("."):
         return False
     return name.lower().endswith(ARTIFACT_EXTENSIONS)
+
+
+def _is_final_output_artifact(relative_path: str) -> bool:
+    path = PurePosixPath(relative_path)
+    return (
+        len(path.parts) >= 2
+        and path.parts[0] == FINAL_OUTPUT_DIR
+        and _is_candidate_artifact(relative_path)
+    )
 
 
 def _artifact_type(relative_path: str) -> str:

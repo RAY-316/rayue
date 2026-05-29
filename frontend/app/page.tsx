@@ -61,7 +61,8 @@ const statusLabel: Record<string, string> = {
 };
 
 const MAX_UPLOAD_FILES = 10;
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_MB = 150;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const PROCESS_DETAIL_LIMIT = 360;
 const MAX_EVENT_HISTORY = 3000;
 const INLINE_ARTIFACT_LIMIT = 12;
@@ -524,7 +525,32 @@ function isProcessEvent(event: AgentEvent) {
   ].includes(event.type);
 }
 
+const SETTLED_PROCESS_EVENTS_TO_IGNORE = new Set([
+  "app_server_initialized",
+  "artifacts_synced",
+  "conversation_status",
+  "diff_updated",
+  "error",
+  "input_files_synced",
+  "item_completed",
+  "item_started",
+  "plan_updated",
+  "reasoning_delta",
+  "sandbox_started",
+  "sandbox_starting",
+  "skills_synced",
+  "thread_started",
+  "turn_interrupted",
+  "turn_recovered",
+  "turn_started",
+  "turn_watchdog",
+]);
+
 function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
+  if (group.status !== "running" && SETTLED_PROCESS_EVENTS_TO_IGNORE.has(event.type)) {
+    return;
+  }
+
   if (event.type === "reasoning_delta") {
     const delta = getPayloadString(event.payload, "delta");
     const method = getPayloadString(event.payload, "method");
@@ -1577,7 +1603,7 @@ export default function Home() {
     }
     const oversized = selected.find((file) => file.size > MAX_UPLOAD_BYTES);
     if (oversized) {
-      setError(`${oversized.name} 超过 50MB 单文件限制`);
+      setError(`${oversized.name} 超过 ${MAX_UPLOAD_MB}MB 单文件限制`);
       return;
     }
     setUploading(true);

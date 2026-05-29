@@ -48,7 +48,8 @@ async def save_uploaded_file(
                 written += len(chunk)
                 if written > settings.max_upload_file_bytes:
                     raise UploadValidationError(
-                        f"{upload.filename or 'upload'} exceeds the 50 MB per-file limit"
+                        f"{upload.filename or 'upload'} exceeds the "
+                        f"{_format_upload_limit(settings.max_upload_file_bytes)} per-file limit"
                     )
                 file.write(chunk)
     except Exception:
@@ -69,9 +70,20 @@ def list_uploaded_files(settings: Settings, conversation_id: str) -> list[Upload
     ]
 
 
+def _format_upload_limit(byte_count: int) -> str:
+    megabytes = byte_count / (1024 * 1024)
+    if megabytes.is_integer():
+        return f"{int(megabytes)} MB"
+    return f"{megabytes:.1f} MB"
+
+
 def delete_uploaded_file(settings: Settings, conversation_id: str, path: str) -> None:
     local_path = _resolve_uploaded_relative_path(settings, conversation_id, path)
     local_path.unlink(missing_ok=True)
+
+
+def resolve_uploaded_file_path(settings: Settings, conversation_id: str, path: str) -> Path:
+    return _resolve_uploaded_relative_path(settings, conversation_id, path)
 
 
 def render_upload_context(settings: Settings, conversation_id: str) -> str:
@@ -83,7 +95,8 @@ def render_upload_context(settings: Settings, conversation_id: str) -> str:
         "",
         "Uploaded input files are available in the current workspace.",
         f"Treat `{settings.sandbox_inputs_dir}/` as read-only input/reference material.",
-        "Write generated or modified deliverables outside that input directory.",
+        "Write intermediate work under `work/` or `tmp/`.",
+        "Copy only final user-facing deliverables into `outputs/`; only `outputs/` is saved and shown to the user.",
         "Input file paths:",
     ]
     for file in files:

@@ -149,13 +149,13 @@ New sandboxes receive one archive and extract it into `$CODEX_HOME/skills/`. The
 
 ## Artifacts
 
-Files created in the conversation workspace are copied to local storage when a turn completes:
+Final files created under `/home/user/workspace/outputs/` are copied to local storage when a turn completes:
 
 ```text
 storage/artifacts/<conversation_id>/
 ```
 
-The frontend Artifacts panel lists these persisted files and downloads from local storage first. If a file has not been synced yet and the sandbox is still alive, the backend can still read it from E2B.
+When S3/R2 settings are configured, final outputs are also mirrored to object storage. New sandboxes restore `outputs/` through short-lived signed object-storage downloads instead of streaming the files through the backend. The frontend Artifacts panel lists these persisted final files and downloads from local storage first. Intermediate files under `work/`, `tmp/`, extracted Office packages, renders, logs, and thumbnails are treated as transient workspace state and are not persisted as user-facing artifacts. Final output files up to 1 GB are allowed.
 
 API:
 
@@ -164,7 +164,7 @@ GET /api/conversations/{conversation_id}/artifacts
 GET /api/conversations/{conversation_id}/artifacts/download?path=<workspace-relative-path>
 ```
 
-Only files from `/home/user/workspace` are synced/exposed. `storage/` is gitignored.
+Only files from `/home/user/workspace/outputs/` are synced/exposed as artifacts. Uploaded inputs are stored separately. `storage/` is gitignored.
 
 Uploaded user input files are stored separately:
 
@@ -178,12 +178,14 @@ The backend syncs them into each sandbox at:
 /home/user/workspace/inputs/
 ```
 
-Those files are listed through `GET /api/conversations/{conversation_id}/uploads` and uploaded through `POST /api/conversations/{conversation_id}/uploads`. The upload endpoint accepts at most 10 files per request and rejects any single file above 50 MB. Files under `inputs/` are treated as input/reference material and are excluded from the downloadable Artifacts panel.
+Those files are listed through `GET /api/conversations/{conversation_id}/uploads` and uploaded through `POST /api/conversations/{conversation_id}/uploads`. The upload endpoint accepts at most 10 files per request and rejects any single file above 150 MB. Files under `inputs/` are treated as input/reference material and are excluded from the downloadable Artifacts panel. When S3/R2 is configured, uploaded inputs are mirrored to object storage and new sandboxes download them directly from signed URLs.
+
+Object storage uses the S3-compatible environment names `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY`. `RAYUE_S3_*` and `XPET_S3_*` aliases also work.
 
 ## Current Limits
 
 - No auth yet; this is an internal-test demo.
-- Conversation data is persisted in PostgreSQL; generated workspace files are persisted locally under `storage/artifacts/`; uploaded input files are persisted locally under `storage/uploads/`.
+- Conversation data is persisted in PostgreSQL; generated workspace files are persisted locally under `storage/artifacts/`; uploaded input files are persisted locally under `storage/uploads/`; configured S3/R2 storage is used as the sandbox restore path for inputs and final outputs.
 - One active in-memory worker is kept per conversation while the backend is running.
 - Idle workers are closed after `SANDBOX_IDLE_TIMEOUT_SECONDS`, default `900`.
 - GitHub integration is intentionally not connected yet.
