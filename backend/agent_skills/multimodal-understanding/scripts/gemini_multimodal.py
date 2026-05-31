@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import mimetypes
 import os
@@ -15,9 +16,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 BUNDLED_API_KEY = "AIzaSyCAafLa5s5VXB0xx1RgPYiQGg2Pr2MGV7I"
-API_ROOT = "https://generativelanguage.googleapis.com"
+API_ROOT = os.environ.get("GOOGLE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com").rstrip("/")
 MIME_OVERRIDES = {
     ".md": "text/markdown",
     ".markdown": "text/markdown",
@@ -73,7 +74,11 @@ def request_json(
     try:
         with urlopen(req, timeout=timeout) as response:
             text = response.read().decode("utf-8")
-            data = json.loads(text) if text.strip() else {}
+            try:
+                data = json.loads(text) if text.strip() else {}
+            except json.JSONDecodeError as exc:
+                preview = text[:500].replace(api_key, "[REDACTED]")
+                raise SystemExit(f"Gemini returned non-JSON response: {preview}") from exc
             return data, {k.lower(): v for k, v in response.headers.items()}
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -176,6 +181,10 @@ def build_generate_payload(
 ) -> dict[str, Any]:
     parts: list[dict[str, Any]] = []
     for file_obj in uploaded_files:
+        inline_data = file_obj.get("inline_data")
+        if isinstance(inline_data, dict):
+            parts.append({"inline_data": inline_data})
+            continue
         mime_type = file_obj.get("mimeType") or file_obj.get("mime_type")
         parts.append(
             {
@@ -200,6 +209,27 @@ def build_generate_payload(
     if google_search:
         payload["tools"] = [{"google_search": {}}]
     return payload
+
+
+def build_inline_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise SystemExit(f"File not found: {path}")
+    return {
+        "inline_data": {
+            "mime_type": guess_mime(path),
+            "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+    }
+
+
+def should_use_inline_files() -> bool:
+    configured = os.environ.get("GOOGLE_GEMINI_USE_INLINE_FILES")
+    if configured is not None:
+        return configured.strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get("GOOGLE_GEMINI_BASE_URL", "").strip().rstrip("/") not in (
+        "",
+        "https://generativelanguage.googleapis.com",
+    )
 
 
 def generate_content(
@@ -271,15 +301,18 @@ def main() -> int:
     api_key = get_api_key(args.api_key)
     uploaded_files: list[dict[str, Any]] = []
     try:
-        for path in paths:
-            uploaded_files.append(
-                upload_file(
-                    path,
-                    api_key=api_key,
-                    timeout=args.timeout,
-                    poll_timeout=args.poll_timeout,
+        if should_use_inline_files():
+            uploaded_files = [build_inline_file(path) for path in paths]
+        else:
+            for path in paths:
+                uploaded_files.append(
+                    upload_file(
+                        path,
+                        api_key=api_key,
+                        timeout=args.timeout,
+                        poll_timeout=args.poll_timeout,
+                    )
                 )
-            )
         payload = build_generate_payload(
             prompt=prompt,
             uploaded_files=uploaded_files,

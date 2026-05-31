@@ -17,6 +17,7 @@ from app.skills import build_skill_bundle
 
 TEMPLATE_NAME = os.environ.get("RAYUE_TEMPLATE_NAME", "rayue-agent-v2")
 BASE_TEMPLATE = os.environ.get("RAYUE_TEMPLATE_BASE", "codex")
+CODEX_PACKAGE = os.environ.get("RAYUE_CODEX_PACKAGE", "@openai/codex@0.135.0")
 
 APT_PACKAGES = [
     "build-essential",
@@ -175,6 +176,7 @@ def main() -> None:
         .from_template(BASE_TEMPLATE)
         .apt_install(APT_PACKAGES, no_install_recommends=True)
         .pip_install(PYTHON_PACKAGES, g=True)
+        .run_cmd(f"npm install -g --force {sh_single_quote(CODEX_PACKAGE)}")
         .run_cmd(f"npm install -g --force {' '.join(GLOBAL_NODE_PACKAGES)}")
         .run_cmd("python -m playwright install --with-deps chromium")
         .copy(apply_patch_relative_path, "/tmp/rayue-apply-patch")
@@ -213,7 +215,8 @@ def main() -> None:
 
     print(
         f"Building E2B template {TEMPLATE_NAME!r} from {BASE_TEMPLATE!r} "
-        f"with {bundle.skill_count} skills and {len(APT_PACKAGES) + len(PYTHON_PACKAGES) + len(GLOBAL_NODE_PACKAGES) + len(WORKSPACE_NODE_PACKAGES)} packages."
+        f"with Codex package {CODEX_PACKAGE!r}, "
+        f"{bundle.skill_count} skills and {len(APT_PACKAGES) + len(PYTHON_PACKAGES) + 1 + len(GLOBAL_NODE_PACKAGES) + len(WORKSPACE_NODE_PACKAGES)} packages."
     )
     Template.build(
         template,
