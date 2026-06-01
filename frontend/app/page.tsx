@@ -1,12 +1,19 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ChevronDown,
   ChevronRight,
   CheckCircle2,
   Code2,
   Download,
+  Folder,
+  HardDrive,
+  KeyRound,
+  LogOut,
+  Mail,
+  Pencil,
   FileText,
   FileUp,
   Lightbulb,
@@ -17,7 +24,6 @@ import {
   Plus,
   RefreshCw,
   Send,
-  Settings,
   Sparkles,
   Square,
   SquareTerminal,
@@ -31,21 +37,38 @@ import {
   Artifact,
   Conversation,
   Message,
-  Skill,
   UploadedFile,
+  User,
+  Workspace,
+  WorkspaceFile,
   artifactDownloadUrl,
+  clearAuthToken,
+  completePasswordReset,
+  completeRegister,
+  conversationEventsUrl,
   createConversation,
+  createWorkspace,
+  deleteWorkspaceFile,
   deleteConversation,
-  getApiBase,
+  getCaptcha,
+  getAuthToken,
   getConversation,
   listArtifacts,
   listConversations,
-  listSkills,
   listUploads,
-  putSkill,
+  listWorkspaceFiles,
+  listWorkspaces,
+  login,
+  logout,
+  me,
   sendMessage,
+  setAuthToken,
   stopConversation,
+  startPasswordReset,
+  startRegister,
+  updateWorkspace,
   uploadFiles,
+  workspaceFileDownloadUrl,
 } from "@/lib/api";
 import type { LocalMessage } from "@/components/types";
 import ReactMarkdown from "react-markdown";
@@ -61,7 +84,7 @@ const statusLabel: Record<string, string> = {
 };
 
 const MAX_UPLOAD_FILES = 10;
-const MAX_UPLOAD_MB = 150;
+const MAX_UPLOAD_MB = 1024;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const PROCESS_DETAIL_LIMIT = 360;
 const MAX_EVENT_HISTORY = 3000;
@@ -110,17 +133,17 @@ function normalizeItemId(payload: Record<string, unknown>): string | undefined {
 
 type ProcessStep = {
   id: string;
-  kind: "reasoning" | "command" | "file" | "setup" | "result" | "error";
+  kind: "reasoning" | "command" | "file" | "setup" | "result" | "warning" | "error";
   title: string;
   detail?: string;
-  status?: "running" | "done" | "error";
+  status?: "running" | "done" | "warning" | "error";
 };
 
 type ActiveProcess = {
-  kind: "reasoning" | "command" | "network" | "file" | "setup" | "error";
+  kind: "reasoning" | "command" | "network" | "file" | "setup" | "warning" | "error";
   title: string;
   detail?: string;
-  status?: "running" | "done" | "error";
+  status?: "running" | "done" | "warning" | "error";
 };
 
 type ProcessGroup = {
@@ -610,19 +633,19 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
         };
       } else {
         group.failedCommandCount += 1;
-        const failure = commandFailureSummary(item);
+        const failure = commandFailureDetail(item);
         upsertStep(group, {
           id: `command-${itemId}`,
           kind: "command",
-          title: "命令失败，已继续处理",
+          title: "一次尝试未成功，已继续换方案",
           detail: combineDetails(compactCommand(command), failure),
-          status: "error",
+          status: "warning",
         });
         group.active = {
-          kind: "error",
-          title: "当前步骤失败，正在尝试其他方式",
+          kind: "warning",
+          title: "上个办法没跑通，正在尝试其他方式",
           detail: failure ?? compactCommand(command),
-          status: "error",
+          status: "running",
         };
       }
     }
@@ -740,13 +763,6 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
   }
 
   if (event.type === "skills_synced") {
-    upsertStep(group, {
-      id: `skills-${getPayloadString(event.payload, "hash") ?? ""}`,
-      kind: "setup",
-      title: `加载能力 ${getPayloadNumber(event.payload, "count") ?? ""} 个`,
-      status: "done",
-    });
-    group.active = { kind: "setup", title: "思考中..", status: "running" };
     return;
   }
 
@@ -931,22 +947,41 @@ function commandSummaryTitle(item: Record<string, unknown>) {
   return `已运行命令 ${formatShortDuration(durationMs)}`;
 }
 
-function commandFailureSummary(item: Record<string, unknown>) {
+function commandFailureDetail(item: Record<string, unknown>) {
+  const exitCode = getPayloadNumber(item, "exitCode");
+  const durationMs = getPayloadNumber(item, "durationMs");
   const output =
     getPayloadString(item, "aggregatedOutput") ??
     getPayloadString(item, "stderr") ??
     getPayloadString(item, "stdout");
+  const parts: string[] = [];
+  if (exitCode !== undefined) {
+    parts.push(exitCode < 0 ? "状态：执行被中断或超过运行限制" : `状态：退出码 ${exitCode}`);
+  }
+  if (durationMs !== undefined && durationMs >= 1000) {
+    parts.push(`耗时：${formatShortDuration(durationMs)}`);
+  }
   if (!output) {
-    return undefined;
+    return parts.length > 0 ? parts.join("\n") : undefined;
   }
   const lines = output
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
   const timeout = lines.find((line) => /timed out|timeout/i.test(line));
+  const missingCommand = lines.find((line) => /command not found|not recognized as|No such file or directory/i.test(line));
+  const missingDependency = lines.find((line) => /Cannot find module|ModuleNotFoundError|ImportError/i.test(line));
   const exception = lines.find((line) => /exception|error|failed/i.test(line));
-  const summary = timeout ?? exception ?? lines.at(-1);
-  return summary ? `原因：${summary.slice(0, PROCESS_DETAIL_LIMIT)}` : undefined;
+  const summary = timeout ?? missingCommand ?? missingDependency ?? exception ?? lines.at(-1);
+  if (summary) {
+    const reason =
+      timeout ? "线索：等待或网络超时" :
+      missingCommand ? "线索：命令或路径不存在" :
+      missingDependency ? "线索：依赖没有被当前命令加载到" :
+      "线索：运行输出提示异常";
+    parts.push(`${reason} - ${summary.slice(0, PROCESS_DETAIL_LIMIT)}`);
+  }
+  return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
 function combineDetails(...parts: (string | undefined)[]) {
@@ -1179,6 +1214,11 @@ function formatProcessDuration(start: string, end?: string) {
 }
 
 export default function Home() {
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<LocalMessage[]>([]);
@@ -1186,12 +1226,8 @@ export default function Home() {
   const [turns, setTurns] = useState<AgentTurn[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [uploads, setUploads] = useState<UploadedFile[]>([]);
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [skillName, setSkillName] = useState("team-defaults");
-  const [skillContent, setSkillContent] = useState(
-    "---\nname: team-defaults\ndescription: Shared behavior for all demo users.\n---\n\n# Team Defaults\n\nAnswer in Chinese unless the user asks otherwise. Prefer root-cause analysis before implementation.\n",
-  );
   const [input, setInput] = useState("");
+  const [mentionedFiles, setMentionedFiles] = useState<WorkspaceFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -1201,13 +1237,20 @@ export default function Home() {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const activeIdRef = useRef<string | null>(null);
+  const activeWorkspaceIdRef = useRef<string | null>(null);
+  const conversationsRef = useRef<Conversation[]>([]);
   const activeStatusRef = useRef("idle");
   const stickToBottomRef = useRef(false);
   const forceScrollBottomRef = useRef(false);
+  const [creatingConversation, setCreatingConversation] = useState(false);
 
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeId) ?? null,
     [activeId, conversations],
+  );
+  const activeWorkspace = useMemo(
+    () => workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null,
+    [activeWorkspaceId, workspaces],
   );
   const activeStatus = activeConversation?.status ?? "idle";
   const turnBusy = activeStatus === "queued" || activeStatus === "running" || activeStatus === "stopping";
@@ -1228,10 +1271,23 @@ export default function Home() {
     () => buildTimeline(messages, processGroups, artifactGroups, turns),
     [messages, processGroups, artifactGroups, turns],
   );
+  const mentionQuery = useMemo(() => activeMentionQuery(input), [input]);
+  const mentionSuggestions = useMemo(
+    () => fileMentionSuggestions(workspaceFiles, mentionedFiles, mentionQuery),
+    [workspaceFiles, mentionedFiles, mentionQuery],
+  );
 
   useEffect(() => {
     activeIdRef.current = activeId;
   }, [activeId]);
+
+  useEffect(() => {
+    activeWorkspaceIdRef.current = activeWorkspaceId;
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
   const isActiveConversation = useCallback((conversationId: string) => {
     return activeIdRef.current === conversationId;
@@ -1240,7 +1296,7 @@ export default function Home() {
   const switchConversation = useCallback((conversationId: string | null) => {
     activeIdRef.current = conversationId;
     activeStatusRef.current =
-      conversations.find((conversation) => conversation.id === conversationId)?.status ?? "idle";
+      conversationsRef.current.find((conversation) => conversation.id === conversationId)?.status ?? "idle";
     setActiveId(conversationId);
     setMessages([]);
     setEvents([]);
@@ -1251,15 +1307,51 @@ export default function Home() {
     setStopping(false);
     stickToBottomRef.current = false;
     forceScrollBottomRef.current = false;
-  }, [conversations]);
+  }, []);
 
-  const refreshConversations = useCallback(async () => {
-    const rows = await listConversations();
-    setConversations(rows);
-    if (!activeId && rows.length > 0) {
+  const refreshConversations = useCallback(async (workspaceId = activeWorkspaceIdRef.current) => {
+    const rows = await listConversations(workspaceId);
+    if (workspaceId !== activeWorkspaceIdRef.current) {
+      return rows;
+    }
+    const currentId = activeIdRef.current;
+    const currentConversation = currentId
+      ? conversationsRef.current.find((conversation) => conversation.id === currentId)
+      : null;
+    const currentStillMissing = currentId && !rows.some((conversation) => conversation.id === currentId);
+    const shouldPreserveCurrent =
+      currentStillMissing &&
+      currentConversation &&
+      (currentConversation.workspace_id ?? null) === workspaceId;
+    const nextRows = shouldPreserveCurrent ? [currentConversation, ...rows] : rows;
+    setConversations(nextRows);
+    conversationsRef.current = nextRows;
+    if (!currentId && rows.length > 0) {
       switchConversation(rows[0].id);
     }
-  }, [activeId, switchConversation]);
+    return nextRows;
+  }, [switchConversation]);
+
+  const refreshWorkspaces = useCallback(async () => {
+    const rows = await listWorkspaces();
+    setWorkspaces(rows);
+    if (!activeWorkspaceIdRef.current && rows.length > 0) {
+      activeWorkspaceIdRef.current = rows[0].id;
+      setActiveWorkspaceId(rows[0].id);
+    }
+    return rows;
+  }, []);
+
+  const refreshWorkspaceFiles = useCallback(async (workspaceId = activeWorkspaceIdRef.current) => {
+    if (!workspaceId) {
+      setWorkspaceFiles([]);
+      return [];
+    }
+    const rows = await listWorkspaceFiles(workspaceId);
+    setWorkspaceFiles(rows);
+    void refreshWorkspaces().catch(() => undefined);
+    return rows;
+  }, [refreshWorkspaces]);
 
   const updateScrollStickiness = useCallback(() => {
     const element = scrollContainerRef.current;
@@ -1271,10 +1363,12 @@ export default function Home() {
   }, []);
 
   const loadActive = useCallback(async (conversationId: string, mode: "replace" | "merge" = "merge") => {
-    const [detail, artifactRows, uploadRows] = await Promise.all([
+    const workspaceId = activeWorkspaceIdRef.current;
+    const [detail, artifactRows, uploadRows, workspaceFileRows] = await Promise.all([
       getConversation(conversationId),
       listArtifacts(conversationId).catch(() => [] as Artifact[]),
       listUploads(conversationId).catch(() => [] as UploadedFile[]),
+      workspaceId ? listWorkspaceFiles(workspaceId).catch(() => [] as WorkspaceFile[]) : Promise.resolve([] as WorkspaceFile[]),
     ]);
     if (!isActiveConversation(conversationId)) {
       return;
@@ -1285,35 +1379,75 @@ export default function Home() {
     setTurns(detail.turns);
     setArtifacts(artifactRows);
     setUploads(uploadRows);
+    setWorkspaceFiles(workspaceFileRows);
     setConversations((prev) =>
       prev.map((conversation) =>
         conversation.id === detail.conversation.id ? detail.conversation : conversation,
       ),
     );
-  }, [isActiveConversation]);
+  }, [activeWorkspaceId, isActiveConversation]);
 
   useEffect(() => {
-    async function boot() {
+    async function bootAuth() {
+      const token = getAuthToken();
+      if (!token) {
+        setAuthChecked(true);
+        setLoading(false);
+        return;
+      }
+      try {
+        const response = await me();
+        setAuthUser(response.user);
+      } catch {
+        clearAuthToken();
+      } finally {
+        setAuthChecked(true);
+        setLoading(false);
+      }
+    }
+    void bootAuth();
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) {
+      return;
+    }
+    async function bootApp() {
       try {
         setLoading(true);
-        const [rows, skillRows] = await Promise.all([listConversations(), listSkills()]);
+        const workspaceRows = await listWorkspaces();
+        const workspace = workspaceRows.find((item) => item.id === activeWorkspaceId) ?? workspaceRows[0];
+        setWorkspaces(workspaceRows);
+        activeWorkspaceIdRef.current = workspace?.id ?? null;
+        setActiveWorkspaceId(workspace?.id ?? null);
+        if (!workspace) {
+          setConversations([]);
+          switchConversation(null);
+          return;
+        }
+        const [rows, fileRows] = await Promise.all([
+          listConversations(workspace.id),
+          listWorkspaceFiles(workspace.id).catch(() => [] as WorkspaceFile[]),
+        ]);
         if (rows.length === 0) {
-          const created = await createConversation();
+          const created = await createConversation(undefined, workspace.id);
           setConversations([created]);
+          conversationsRef.current = [created];
           switchConversation(created.id);
         } else {
           setConversations(rows);
+          conversationsRef.current = rows;
           switchConversation(rows[0].id);
         }
-        setSkills(skillRows);
+        setWorkspaceFiles(fileRows);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load app");
       } finally {
         setLoading(false);
       }
     }
-    void boot();
-  }, []);
+    void bootApp();
+  }, [authUser, switchConversation]);
 
   useEffect(() => {
     if (!activeId) {
@@ -1325,7 +1459,7 @@ export default function Home() {
         setError(err instanceof Error ? err.message : "Failed to load conversation");
       }
     });
-    const source = new EventSource(`${getApiBase()}/api/conversations/${conversationId}/events`);
+    const source = new EventSource(conversationEventsUrl(conversationId));
     let reconnectRefresh: ReturnType<typeof setTimeout> | null = null;
     const refreshActive = () => {
       void loadActive(conversationId).catch(() => undefined);
@@ -1404,6 +1538,7 @@ export default function Home() {
             }
           })
           .catch(() => undefined);
+        void refreshWorkspaceFiles().catch(() => undefined);
       }
       if (event.type === "uploads_updated" || event.type === "input_files_synced") {
         void listUploads(conversationId)
@@ -1413,6 +1548,7 @@ export default function Home() {
             }
           })
           .catch(() => undefined);
+        void refreshWorkspaceFiles().catch(() => undefined);
       }
     };
     source.onerror = () => {
@@ -1428,7 +1564,7 @@ export default function Home() {
         clearTimeout(reconnectRefresh);
       }
     };
-  }, [activeId, isActiveConversation, loadActive]);
+  }, [activeId, isActiveConversation, loadActive, refreshWorkspaceFiles]);
 
   useEffect(() => {
     if (!forceScrollBottomRef.current && !stickToBottomRef.current) {
@@ -1446,12 +1582,30 @@ export default function Home() {
   }, [timelineItems]);
 
   async function handleNewConversation() {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (!workspaceId || creatingConversation) {
+      return;
+    }
     try {
-      const conversation = await createConversation();
-      setConversations((prev) => [conversation, ...prev]);
+      setCreatingConversation(true);
+      setError(null);
+      const conversation = await createConversation(undefined, workspaceId);
+      if (activeWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      const nextConversations = [
+        conversation,
+        ...conversationsRef.current.filter((item) => item.id !== conversation.id),
+      ];
+      conversationsRef.current = nextConversations;
+      setConversations(nextConversations);
       switchConversation(conversation.id);
+      forceScrollBottomRef.current = true;
+      void refreshConversations(workspaceId).catch(() => undefined);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create conversation");
+    } finally {
+      setCreatingConversation(false);
     }
   }
 
@@ -1466,11 +1620,12 @@ export default function Home() {
     try {
       await deleteConversation(conversationId);
       let next = conversations.filter((item) => item.id !== conversationId);
-      if (next.length === 0) {
-        const created = await createConversation();
+      if (next.length === 0 && activeWorkspaceId) {
+        const created = await createConversation(undefined, activeWorkspaceId);
         next = [created];
       }
       setConversations(next);
+      conversationsRef.current = next;
       if (activeId === conversationId) {
         switchConversation(next[0]?.id ?? null);
       }
@@ -1485,10 +1640,12 @@ export default function Home() {
       return;
     }
     const content = input.trim();
+    const filesToMention = resolveMentionedFiles(content, mentionedFiles, workspaceFiles);
     const now = new Date().toISOString();
     const localMessageId = `local-user-${Date.now()}`;
     const localStatusEventId = `local-status-${localMessageId}`;
     setInput("");
+    setMentionedFiles([]);
     setSending(true);
     setError(null);
     activeStatusRef.current = "queued";
@@ -1517,7 +1674,7 @@ export default function Home() {
       ]),
     );
     try {
-      const response = await sendMessage(activeId, content);
+      const response = await sendMessage(activeId, content, filesToMention);
       setMessages((prev) =>
         prev.map((message) =>
           message.id === localMessageId
@@ -1543,6 +1700,16 @@ export default function Home() {
     } finally {
       setSending(false);
     }
+  }
+
+  function handleInputChange(value: string) {
+    setInput(value);
+    setMentionedFiles((prev) => resolveMentionedFiles(value, prev, workspaceFiles));
+  }
+
+  function handlePickMention(file: WorkspaceFile) {
+    setInput((prev) => insertFileMention(prev, file));
+    setMentionedFiles((prev) => upsertMentionedFile(prev, file));
   }
 
   async function handleStop() {
@@ -1582,15 +1749,6 @@ export default function Home() {
     }
   }
 
-  async function handleSaveSkill() {
-    try {
-      const skill = await putSkill(skillName.trim(), skillContent);
-      setSkills((prev) => [skill, ...prev.filter((item) => item.name !== skill.name)]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save skill");
-    }
-  }
-
   async function handleUploadFiles(fileList: FileList | null) {
     if (!activeId || !fileList || fileList.length === 0 || uploading) {
       return;
@@ -1612,6 +1770,7 @@ export default function Home() {
       const rows = await uploadFiles(conversationId, selected);
       if (isActiveConversation(conversationId)) {
         setUploads(rows);
+        void refreshWorkspaceFiles().catch(() => undefined);
       }
     } catch (err) {
       if (isActiveConversation(conversationId)) {
@@ -1623,6 +1782,119 @@ export default function Home() {
         uploadInputRef.current.value = "";
       }
     }
+  }
+
+  async function handleAuthSuccess(response: { user: User; token: string }) {
+    setAuthToken(response.token);
+    setAuthUser(response.user);
+    setError(null);
+  }
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      clearAuthToken();
+    }
+    setAuthUser(null);
+    setWorkspaces([]);
+    setActiveWorkspaceId(null);
+    setWorkspaceFiles([]);
+    setConversations([]);
+    switchConversation(null);
+  }
+
+  async function handleSelectWorkspace(workspaceId: string) {
+    if (workspaceId === activeWorkspaceId) {
+      return;
+    }
+    try {
+      setLoading(true);
+      activeWorkspaceIdRef.current = workspaceId;
+      setActiveWorkspaceId(workspaceId);
+      switchConversation(null);
+      const [rows, files] = await Promise.all([
+        listConversations(workspaceId),
+        listWorkspaceFiles(workspaceId).catch(() => [] as WorkspaceFile[]),
+      ]);
+      if (rows.length === 0) {
+        const created = await createConversation(undefined, workspaceId);
+        setConversations([created]);
+        conversationsRef.current = [created];
+        switchConversation(created.id);
+      } else {
+        setConversations(rows);
+        conversationsRef.current = rows;
+        switchConversation(rows[0].id);
+      }
+      setWorkspaceFiles(files);
+      void refreshWorkspaces().catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to switch workspace");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleCreateWorkspace() {
+    const name = window.prompt("工作区名称", `工作区 ${workspaces.length + 1}`)?.trim();
+    if (!name) {
+      return;
+    }
+    try {
+      const workspace = await createWorkspace(name);
+      setWorkspaces((prev) => [...prev, workspace]);
+      await handleSelectWorkspace(workspace.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create workspace");
+    }
+  }
+
+  async function handleRenameWorkspace(workspace: Workspace) {
+    const name = window.prompt("工作区名称", workspace.name)?.trim();
+    if (!name || name === workspace.name) {
+      return;
+    }
+    try {
+      const updated = await updateWorkspace(workspace.id, name);
+      setWorkspaces((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rename workspace");
+    }
+  }
+
+  async function handleDeleteWorkspaceFile(path: string) {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    const confirmed = window.confirm(`删除文件"${path}"？`);
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await deleteWorkspaceFile(activeWorkspaceId, path);
+      await refreshWorkspaceFiles(activeWorkspaceId);
+      if (activeId) {
+        await loadActive(activeId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete file");
+    }
+  }
+
+  if (!authChecked) {
+    return (
+      <main className="flex h-screen items-center justify-center bg-[#f2f4f7] text-ink">
+        <div className="flex items-center gap-2 text-sm text-muted">
+          <Loader2 className="animate-spin" size={16} />
+          加载中
+        </div>
+      </main>
+    );
+  }
+
+  if (!authUser) {
+    return <AuthScreen onSuccess={(response) => void handleAuthSuccess(response)} />;
   }
 
   return (
@@ -1639,13 +1911,22 @@ export default function Home() {
             </div>
           </div>
           <button
+            type="button"
             className="flex h-9 w-9 items-center justify-center rounded-md border border-line hover:bg-panel"
             onClick={handleNewConversation}
+            disabled={!activeWorkspaceId || creatingConversation}
             title="新对话"
           >
-            <Plus size={17} />
+            {creatingConversation ? <Loader2 className="animate-spin" size={17} /> : <Plus size={17} />}
           </button>
         </div>
+        <WorkspaceNav
+          workspaces={workspaces}
+          activeWorkspaceId={activeWorkspaceId}
+          onSelect={(id) => void handleSelectWorkspace(id)}
+          onCreate={() => void handleCreateWorkspace()}
+          onRename={(workspace) => void handleRenameWorkspace(workspace)}
+        />
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
           {loading ? (
             <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted">
@@ -1664,6 +1945,7 @@ export default function Home() {
                 )}
               >
                 <button
+                  type="button"
                   onClick={() => switchConversation(conversation.id)}
                   className="w-full px-3 py-3 text-left"
                 >
@@ -1700,14 +1982,19 @@ export default function Home() {
             ))
           )}
         </div>
-        <AdminSkillsPanel
-          skills={skills}
-          skillName={skillName}
-          skillContent={skillContent}
-          onNameChange={setSkillName}
-          onContentChange={setSkillContent}
-          onSave={handleSaveSkill}
-        />
+        <div className="border-t border-line bg-white p-3">
+          <div className="mb-2 min-w-0 text-xs text-muted">
+            <div className="truncate font-medium text-ink">{authUser.display_name || authUser.email}</div>
+            <div className="truncate">{authUser.email}</div>
+          </div>
+          <button
+            onClick={() => void handleLogout()}
+            className="flex h-9 w-full items-center justify-center gap-2 rounded-md border border-line text-sm hover:bg-panel"
+          >
+            <LogOut size={15} />
+            退出登录
+          </button>
+        </div>
       </aside>
 
       <section className="flex min-w-0 flex-1 flex-col">
@@ -1715,6 +2002,9 @@ export default function Home() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold">
               {activeConversation?.title ?? "暂无会话"}
+            </div>
+            <div className="mt-0.5 truncate text-xs text-muted">
+              {activeWorkspace?.name ?? "暂无工作区"}
             </div>
           </div>
           <button
@@ -1770,13 +2060,49 @@ export default function Home() {
             </div>
             <form onSubmit={handleSend} className="border-t border-line bg-white p-4">
               <div className="mx-auto flex max-w-4xl gap-3">
-                <textarea
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  rows={2}
-                  className="min-h-[52px] flex-1 resize-none rounded-md border-line text-sm shadow-sm focus:border-accent focus:ring-accent"
-                  placeholder="输入任务，例如：在工作区写一个 README 并解释设计取舍"
-                />
+                <div className="relative min-w-0 flex-1">
+                  {mentionedFiles.length > 0 ? (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                      {mentionedFiles.map((file) => (
+                        <button
+                          key={file.id ?? file.relative_path}
+                          type="button"
+                          className="max-w-full truncate rounded border border-line bg-panel px-2 py-1 text-xs text-muted hover:border-ink hover:text-ink"
+                          onClick={() => setMentionedFiles((prev) => prev.filter((item) => (item.id ?? item.relative_path) !== (file.id ?? file.relative_path)))}
+                          title="移除引用"
+                        >
+                          @{file.name}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  {mentionSuggestions.length > 0 ? (
+                    <div className="absolute bottom-full left-0 z-20 mb-2 max-h-64 w-full overflow-y-auto rounded-md border border-line bg-white p-1 shadow-soft">
+                      {mentionSuggestions.map((file) => (
+                        <button
+                          key={file.id ?? file.relative_path}
+                          type="button"
+                          className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-xs hover:bg-panel"
+                          onClick={() => handlePickMention(file)}
+                        >
+                          <FileText size={14} className="shrink-0 text-muted" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate font-medium text-ink">{file.name}</span>
+                            <span className="block truncate text-muted">{file.relative_path}</span>
+                          </span>
+                          <span className="shrink-0 text-muted">{formatBytes(file.size)}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  <textarea
+                    value={input}
+                    onChange={(event) => handleInputChange(event.target.value)}
+                    rows={2}
+                    className="min-h-[52px] w-full resize-none rounded-md border-line text-sm shadow-sm focus:border-accent focus:ring-accent"
+                    placeholder="输入任务，例如：修改 @文件名 并生成新版本"
+                  />
+                </div>
                 <button
                   type={turnBusy ? "button" : "submit"}
                   onClick={turnBusy ? handleStop : undefined}
@@ -1806,28 +2132,13 @@ export default function Home() {
             </form>
           </div>
           <WorkspacePanel
+            workspace={activeWorkspace}
+            files={workspaceFiles}
             conversation={activeConversation}
-            uploads={uploads}
-            artifacts={artifacts}
-            conversationId={activeId}
             uploading={uploading}
             onPickFiles={() => uploadInputRef.current?.click()}
-            onRefreshArtifacts={() => {
-              if (activeId) {
-                const conversationId = activeId;
-                void listArtifacts(conversationId)
-                  .then((rows) => {
-                    if (isActiveConversation(conversationId)) {
-                      setArtifacts(rows);
-                    }
-                  })
-                  .catch(() => {
-                    if (isActiveConversation(conversationId)) {
-                      setArtifacts([]);
-                    }
-                  });
-              }
-            }}
+            onRefresh={() => void refreshWorkspaceFiles()}
+            onDeleteFile={(path) => void handleDeleteWorkspaceFile(path)}
           />
           <input
             ref={uploadInputRef}
@@ -1917,6 +2228,67 @@ function MarkdownContent({ content, inverted = false }: { content: string; inver
       </ReactMarkdown>
     </div>
   );
+}
+
+function activeMentionQuery(value: string) {
+  const match = value.match(/(?:^|\s)@([^\s@]*)$/);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function fileMentionSuggestions(
+  files: WorkspaceFile[],
+  selected: WorkspaceFile[],
+  query: string | null,
+) {
+  if (query === null) {
+    return [];
+  }
+  const selectedKeys = new Set(selected.map((file) => file.id ?? file.relative_path));
+  return files
+    .filter((file) => file.id || file.relative_path)
+    .filter((file) => !selectedKeys.has(file.id ?? file.relative_path))
+    .filter((file) => {
+      if (!query) {
+        return true;
+      }
+      return `${file.name} ${file.relative_path}`.toLowerCase().includes(query);
+    })
+    .slice(0, 8);
+}
+
+function insertFileMention(value: string, file: WorkspaceFile) {
+  const label = `@${file.relative_path} `;
+  if (/(?:^|\s)@([^\s@]*)$/.test(value)) {
+    return value.replace(/(^|\s)@([^\s@]*)$/, (_match, prefix: string) => `${prefix}${label}`);
+  }
+  return `${value}${value.endsWith(" ") || value.length === 0 ? "" : " "}${label}`;
+}
+
+function upsertMentionedFile(files: WorkspaceFile[], file: WorkspaceFile) {
+  const key = file.id ?? file.relative_path;
+  if (files.some((item) => (item.id ?? item.relative_path) === key)) {
+    return files;
+  }
+  return [...files, file];
+}
+
+function resolveMentionedFiles(
+  content: string,
+  selected: WorkspaceFile[],
+  workspaceFiles: WorkspaceFile[],
+) {
+  const byKey = new Map<string, WorkspaceFile>();
+  for (const file of selected) {
+    if (content.includes(`@${file.relative_path}`) || content.includes(`@${file.name}`)) {
+      byKey.set(file.id ?? file.relative_path, file);
+    }
+  }
+  for (const file of workspaceFiles) {
+    if (content.includes(`@${file.relative_path}`) || content.includes(`@${file.name}`)) {
+      byKey.set(file.id ?? file.relative_path, file);
+    }
+  }
+  return Array.from(byKey.values());
 }
 
 function liveProcessContext(active?: ActiveProcess) {
@@ -2015,7 +2387,14 @@ function ProcessCard({ group }: { group: ProcessGroup }) {
                     {step.kind === "reasoning" ? <MarkdownContent content={step.title} /> : step.title}
                   </div>
                   {step.detail ? (
-                    <div className="mt-0.5 truncate font-mono text-[11px] text-muted/80">{step.detail}</div>
+                    <div
+                      className={clsx(
+                        "mt-0.5 font-mono text-[11px] text-muted/80",
+                        step.status === "warning" || step.status === "error" ? "whitespace-pre-wrap break-words" : "truncate",
+                      )}
+                    >
+                      {step.detail}
+                    </div>
                   ) : null}
                 </div>
               </div>
@@ -2104,6 +2483,9 @@ function processIconFor(
   if (status === "running") {
     return <Loader2 className="animate-spin text-muted" size={14} />;
   }
+  if (status === "warning" || kind === "warning") {
+    return <AlertTriangle className="text-warn" size={14} />;
+  }
   if (status === "error" || kind === "error") {
     return <XCircle className="text-bad" size={14} />;
   }
@@ -2119,28 +2501,279 @@ function processIconFor(
   return <CheckCircle2 className="text-good" size={14} />;
 }
 
+function AuthScreen({ onSuccess }: { onSuccess: (response: { user: User; token: string }) => void }) {
+  const [mode, setMode] = useState<"login" | "register" | "reset">("login");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [captchaId, setCaptchaId] = useState("");
+  const [captchaImage, setCaptchaImage] = useState("");
+  const [captchaAnswer, setCaptchaAnswer] = useState("");
+  const needsCaptcha = mode !== "login" && !codeSent;
+
+  const refreshCaptcha = useCallback(async () => {
+    setCaptchaAnswer("");
+    setCaptchaId("");
+    setCaptchaImage("");
+    const challenge = await getCaptcha();
+    setCaptchaId(challenge.captcha_id);
+    setCaptchaImage(challenge.image_data_url);
+  }, []);
+
+  useEffect(() => {
+    if (!needsCaptcha) {
+      return;
+    }
+    let cancelled = false;
+    setCaptchaAnswer("");
+    setCaptchaId("");
+    setCaptchaImage("");
+    getCaptcha()
+      .then((challenge) => {
+        if (cancelled) {
+          return;
+        }
+        setCaptchaId(challenge.captcha_id);
+        setCaptchaImage(challenge.image_data_url);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "验证码加载失败");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsCaptcha, mode]);
+
+  function switchMode(next: "login" | "register" | "reset") {
+    setMode(next);
+    setCode("");
+    setCodeSent(false);
+    setMessage(null);
+    setError(null);
+    setCaptchaId("");
+    setCaptchaImage("");
+    setCaptchaAnswer("");
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      if (mode === "login") {
+        try {
+          onSuccess(await login(email, password));
+        } catch (err) {
+          const text = err instanceof Error ? err.message : "登录失败";
+          if (text.includes("账号已在其他地方登录") && window.confirm("账号已在其他地方登录，是否强制登录？")) {
+            onSuccess(await login(email, password, true));
+            return;
+          }
+          throw err;
+        }
+        return;
+      }
+      if (mode === "register" && !codeSent) {
+        const response = await startRegister(email, displayName, captchaId, captchaAnswer);
+        setCodeSent(true);
+        setCaptchaId("");
+        setCaptchaImage("");
+        setCaptchaAnswer("");
+        setMessage(response.code ? `验证码：${response.code}` : "验证码已发送");
+        return;
+      }
+      if (mode === "register") {
+        onSuccess(await completeRegister(email, code, password, displayName));
+        return;
+      }
+      if (mode === "reset" && !codeSent) {
+        const response = await startPasswordReset(email, captchaId, captchaAnswer);
+        setCodeSent(true);
+        setCaptchaId("");
+        setCaptchaImage("");
+        setCaptchaAnswer("");
+        setMessage(response.code ? `验证码：${response.code}` : "验证码已发送");
+        return;
+      }
+      onSuccess(await completePasswordReset(email, code, password));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="flex h-screen items-center justify-center bg-[#f2f4f7] px-4 text-ink">
+      <section className="w-full max-w-[420px] rounded-md border border-line bg-white p-6 shadow-soft">
+        <div className="mb-6 flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-md bg-ink text-white">
+            <Code2 size={19} />
+          </div>
+          <div>
+            <div className="text-base font-semibold">Rayue</div>
+            <div className="text-xs text-muted">智能体工作台</div>
+          </div>
+        </div>
+        <div className="mb-5 grid grid-cols-3 rounded-md border border-line p-1 text-sm">
+          {[
+            ["login", "登录"],
+            ["register", "注册"],
+            ["reset", "找回"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => switchMode(key as "login" | "register" | "reset")}
+              className={clsx("h-9 rounded text-sm", mode === key ? "bg-ink text-white" : "text-muted hover:bg-panel")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <label className="block">
+            <span className="mb-1 flex items-center gap-1 text-xs font-medium text-muted">
+              <Mail size={13} />
+              邮箱
+            </span>
+            <input
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              type="email"
+              required
+              className="w-full rounded-md border-line text-sm focus:border-accent focus:ring-accent"
+            />
+          </label>
+          {mode === "register" ? (
+            <label className="block">
+              <span className="mb-1 text-xs font-medium text-muted">昵称</span>
+              <input
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                className="w-full rounded-md border-line text-sm focus:border-accent focus:ring-accent"
+              />
+            </label>
+          ) : null}
+          {needsCaptcha ? (
+            <div className="space-y-2">
+              <div className="flex items-end gap-2">
+                <label className="block flex-1">
+                  <span className="mb-1 text-xs font-medium text-muted">图片验证</span>
+                  <input
+                    value={captchaAnswer}
+                    onChange={(event) =>
+                      setCaptchaAnswer(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))
+                    }
+                    required
+                    autoCapitalize="characters"
+                    className="w-full rounded-md border-line font-mono text-sm tracking-[0.2em] focus:border-accent focus:ring-accent"
+                  />
+                </label>
+                <div className="flex h-10 w-[132px] items-center justify-center overflow-hidden rounded-md border border-line bg-panel">
+                  {captchaImage ? (
+                    <img src={captchaImage} alt="验证码" className="h-full w-full object-cover" />
+                  ) : (
+                    <Loader2 className="animate-spin text-muted" size={16} />
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    refreshCaptcha().catch((err) => setError(err instanceof Error ? err.message : "验证码加载失败"));
+                  }}
+                  className="flex h-10 w-10 items-center justify-center rounded-md border border-line text-muted hover:bg-panel"
+                  title="刷新"
+                >
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {mode !== "login" && codeSent ? (
+            <label className="block">
+              <span className="mb-1 text-xs font-medium text-muted">验证码</span>
+              <input
+                value={code}
+                onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                required
+                inputMode="numeric"
+                className="w-full rounded-md border-line font-mono text-sm focus:border-accent focus:ring-accent"
+              />
+            </label>
+          ) : null}
+          {(mode === "login" || codeSent) ? (
+            <label className="block">
+              <span className="mb-1 flex items-center gap-1 text-xs font-medium text-muted">
+                <KeyRound size={13} />
+                密码
+              </span>
+              <input
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                type="password"
+                required
+                minLength={mode === "login" ? 1 : 8}
+                className="w-full rounded-md border-line text-sm focus:border-accent focus:ring-accent"
+              />
+            </label>
+          ) : null}
+          {message ? <div className="rounded-md bg-emerald-50 px-3 py-2 text-xs text-good">{message}</div> : null}
+          {error ? <div className="rounded-md bg-red-50 px-3 py-2 text-xs text-bad">{error}</div> : null}
+          <button
+            type="submit"
+            disabled={
+              busy ||
+              !email.trim() ||
+              (mode === "login" && !password) ||
+              (needsCaptcha && (!captchaId || captchaAnswer.trim().length < 4))
+            }
+            className="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-ink text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-muted"
+          >
+            {busy ? <Loader2 className="animate-spin" size={15} /> : null}
+            {mode === "login" ? "登录" : codeSent ? "完成" : "发送验证码"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
 function WorkspacePanel({
+  workspace,
+  files,
   conversation,
-  uploads,
-  artifacts,
-  conversationId,
   uploading,
   onPickFiles,
-  onRefreshArtifacts,
+  onRefresh,
+  onDeleteFile,
 }: {
+  workspace: Workspace | null;
+  files: WorkspaceFile[];
   conversation: Conversation | null;
-  uploads: UploadedFile[];
-  artifacts: Artifact[];
-  conversationId: string | null;
   uploading: boolean;
   onPickFiles: () => void;
-  onRefreshArtifacts: () => void;
+  onRefresh: () => void;
+  onDeleteFile: (path: string) => void;
 }) {
+  const inputFiles = files.filter((file) => file.kind === "input");
+  const outputFiles = files.filter((file) => file.kind === "output");
+  const usedPercent = workspace
+    ? Math.min(100, Math.round((workspace.used_bytes / Math.max(1, workspace.limit_bytes)) * 100))
+    : 0;
   return (
     <aside className="min-h-0 border-l border-line bg-white">
       <div className="flex h-16 items-center justify-between border-b border-line px-4">
         <div className="flex items-center gap-2 text-sm font-semibold">
-          <Paperclip size={17} />
+          <HardDrive size={17} />
           工作区
         </div>
         <StatusBadge status={conversation?.status ?? "idle"} />
@@ -2151,63 +2784,112 @@ function WorkspacePanel({
             {conversation.error}
           </div>
         ) : null}
-        <InputFilesPanel
-          uploads={uploads}
-          conversationId={conversationId}
-          uploading={uploading}
-          onPickFiles={onPickFiles}
+        <section className="mb-3 rounded-md border border-line bg-white p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold">{workspace?.name ?? "暂无工作区"}</div>
+              <div className="mt-1 text-xs text-muted">
+                已用 {formatBytes(workspace?.used_bytes ?? 0)} / {formatBytes(workspace?.limit_bytes ?? 0)}
+              </div>
+            </div>
+            <button
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-line hover:bg-panel"
+              onClick={onRefresh}
+              disabled={!workspace}
+              title="刷新"
+            >
+              <RefreshCw size={14} />
+            </button>
+          </div>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-panel">
+            <div className="h-full bg-ink" style={{ width: `${usedPercent}%` }} />
+          </div>
+          <div className="mt-2 text-xs text-muted">剩余 {formatBytes(workspace?.available_bytes ?? 0)}</div>
+        </section>
+        <WorkspaceFileSection
+          title="Input"
+          icon={<Paperclip size={15} />}
+          files={inputFiles}
+          workspaceId={workspace?.id ?? null}
+          emptyText="暂无输入资料"
+          action={
+            <button
+              className="flex h-7 items-center gap-1 rounded border border-line px-2 text-xs hover:bg-panel disabled:cursor-not-allowed disabled:text-muted"
+              onClick={onPickFiles}
+              disabled={!workspace || uploading}
+            >
+              {uploading ? <Loader2 className="animate-spin" size={13} /> : <FileUp size={13} />}
+              上传
+            </button>
+          }
+          onDeleteFile={onDeleteFile}
         />
-        <ArtifactPanel
-          artifacts={artifacts}
-          conversationId={conversationId}
-          onRefresh={onRefreshArtifacts}
+        <WorkspaceFileSection
+          title="Output"
+          icon={<FileText size={15} />}
+          files={outputFiles}
+          workspaceId={workspace?.id ?? null}
+          emptyText="暂无生成文件"
+          onDeleteFile={onDeleteFile}
         />
       </div>
     </aside>
   );
 }
 
-function ArtifactPanel({
-  artifacts,
-  conversationId,
-  onRefresh,
+function WorkspaceFileSection({
+  title,
+  icon,
+  files,
+  workspaceId,
+  emptyText,
+  action,
+  onDeleteFile,
 }: {
-  artifacts: Artifact[];
-  conversationId: string | null;
-  onRefresh: () => void;
+  title: string;
+  icon: ReactNode;
+  files: WorkspaceFile[];
+  workspaceId: string | null;
+  emptyText: string;
+  action?: ReactNode;
+  onDeleteFile: (path: string) => void;
 }) {
-  const displayedArtifacts = selectPanelArtifacts(artifacts);
   return (
     <section className="mb-3 rounded-md border border-line bg-white">
       <div className="flex items-center justify-between border-b border-line px-3 py-2">
         <div className="flex items-center gap-2 text-xs font-semibold">
-          <FileText size={15} />
-          生成文件
+          {icon}
+          {title}
         </div>
-        <button
-          className="flex h-7 items-center gap-1 rounded border border-line px-2 text-xs hover:bg-panel"
-          onClick={onRefresh}
-          disabled={!conversationId}
-        >
-          <RefreshCw size={13} />
-          刷新
-        </button>
+        {action}
       </div>
-      <div className="max-h-48 overflow-y-auto p-2">
-        {displayedArtifacts.length === 0 ? (
-          <div className="px-1 py-2 text-xs text-muted">暂无可下载文件</div>
+      <div className="max-h-64 overflow-y-auto p-2">
+        {files.length === 0 ? (
+          <div className="px-1 py-2 text-xs text-muted">{emptyText}</div>
         ) : (
-          displayedArtifacts.map((artifact) => (
-            <a
-              key={artifact.path}
-              className="mb-1 flex items-center gap-2 rounded-md px-2 py-2 text-xs hover:bg-panel"
-              href={conversationId ? artifactDownloadUrl(conversationId, artifact.path) : "#"}
-              download={artifact.name}
-            >
-              <Download size={14} className="shrink-0 text-muted" />
-              <span className="min-w-0 flex-1 truncate">{artifact.relative_path}</span>
-              <span className="shrink-0 text-muted">{formatBytes(artifact.size)}</span>
-            </a>
+          files.map((file) => (
+            <div key={file.relative_path} className="mb-1 flex items-center gap-2 rounded-md px-2 py-2 text-xs hover:bg-panel">
+              <FileText size={14} className="shrink-0 text-muted" />
+              <span className="min-w-0 flex-1 truncate" title={file.relative_path}>{file.relative_path}</span>
+              <span className="shrink-0 text-muted">{formatBytes(file.size)}</span>
+              {workspaceId ? (
+                <a
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded hover:bg-white"
+                  href={workspaceFileDownloadUrl(workspaceId, file.relative_path)}
+                  download={file.name}
+                  title="下载"
+                >
+                  <Download size={14} />
+                </a>
+              ) : null}
+              <button
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-muted hover:bg-bad/10 hover:text-bad"
+                onClick={() => onDeleteFile(file.relative_path)}
+                title="删除"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
           ))
         )}
       </div>
@@ -2215,47 +2897,82 @@ function ArtifactPanel({
   );
 }
 
-function InputFilesPanel({
-  uploads,
-  conversationId,
-  uploading,
-  onPickFiles,
+function WorkspaceNav({
+  workspaces,
+  activeWorkspaceId,
+  onSelect,
+  onCreate,
+  onRename,
 }: {
-  uploads: UploadedFile[];
-  conversationId: string | null;
-  uploading: boolean;
-  onPickFiles: () => void;
+  workspaces: Workspace[];
+  activeWorkspaceId: string | null;
+  onSelect: (id: string) => void;
+  onCreate: () => void;
+  onRename: (workspace: Workspace) => void;
 }) {
   return (
-    <section className="mb-3 rounded-md border border-line bg-white">
-      <div className="flex items-center justify-between border-b border-line px-3 py-2">
+    <div className="border-b border-line bg-white p-3">
+      <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs font-semibold">
-          <Paperclip size={15} />
-          上传资料
+          <Folder size={15} />
+          Workspaces
         </div>
         <button
+          type="button"
           className="flex h-7 items-center gap-1 rounded border border-line px-2 text-xs hover:bg-panel disabled:cursor-not-allowed disabled:text-muted"
-          onClick={onPickFiles}
-          disabled={!conversationId || uploading}
+          onClick={onCreate}
+          disabled={workspaces.length >= 3}
+          title="新建工作区"
         >
-          {uploading ? <Loader2 className="animate-spin" size={13} /> : <FileUp size={13} />}
-          上传
+          <Plus size={13} />
+          新建
         </button>
       </div>
-      <div className="max-h-48 overflow-y-auto p-2">
-        {uploads.length === 0 ? (
-          <div className="px-1 py-2 text-xs text-muted">暂无上传资料</div>
-        ) : (
-          uploads.map((file) => (
-            <div key={file.relative_path} className="mb-1 flex items-center gap-2 rounded-md px-2 py-2 text-xs">
-              <FileText size={14} className="shrink-0 text-muted" />
-              <span className="min-w-0 flex-1 truncate">{file.relative_path}</span>
-              <span className="shrink-0 text-muted">{formatBytes(file.size)}</span>
+      <div className="space-y-1">
+        {workspaces.map((workspace) => {
+          const usedPercent = Math.min(100, Math.round((workspace.used_bytes / Math.max(1, workspace.limit_bytes)) * 100));
+          const active = workspace.id === activeWorkspaceId;
+          return (
+            <div
+              key={workspace.id}
+              className={clsx(
+                "rounded-md border text-xs transition",
+                active ? "border-ink bg-ink text-white" : "border-line hover:bg-panel",
+              )}
+            >
+              <div className="flex items-center gap-1 px-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => onSelect(workspace.id)}
+                  className="min-w-0 flex-1 text-left"
+                  title={workspace.name}
+                >
+                  <span className="block truncate font-medium">{workspace.name}</span>
+                </button>
+                <span className={clsx("shrink-0", active ? "text-white/70" : "text-muted")}>{usedPercent}%</span>
+                <button
+                  type="button"
+                  onClick={() => onRename(workspace)}
+                  className={clsx(
+                    "flex h-6 w-6 shrink-0 items-center justify-center rounded",
+                    active ? "text-white/80 hover:bg-white/10" : "text-muted hover:bg-white",
+                  )}
+                  title="重命名"
+                >
+                  <Pencil size={13} />
+                </button>
+              </div>
+              <div
+                className={clsx("mx-2 mb-2 mt-1 h-1 overflow-hidden rounded-full", active ? "bg-white/20" : "bg-panel")}
+                onClick={() => onSelect(workspace.id)}
+              >
+                <div className={clsx("h-full", active ? "bg-white" : "bg-ink")} style={{ width: `${usedPercent}%` }} />
+              </div>
             </div>
-          ))
-        )}
+          );
+        })}
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -2278,67 +2995,6 @@ function StatusBadge({ status }: { status: string }) {
       )}
     >
       {statusLabel[status] ?? status}
-    </div>
-  );
-}
-
-function AdminSkillsPanel({
-  skills,
-  skillName,
-  skillContent,
-  onNameChange,
-  onContentChange,
-  onSave,
-}: {
-  skills: Skill[];
-  skillName: string;
-  skillContent: string;
-  onNameChange: (name: string) => void;
-  onContentChange: (content: string) => void;
-  onSave: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="border-t border-line bg-white p-3">
-      <button
-        onClick={() => setOpen((value) => !value)}
-        className="flex w-full items-center justify-between rounded-md border border-line px-3 py-2 text-sm hover:bg-panel"
-      >
-        <span className="flex items-center gap-2">
-          <Settings size={15} />
-          Admin skills
-        </span>
-        <span className="text-xs text-muted">{skills.length}</span>
-      </button>
-      {open ? (
-        <div className="mt-3 space-y-3">
-          <div className="space-y-1">
-            {skills.map((skill) => (
-              <div key={skill.name} className="rounded-md bg-panel px-2 py-1 text-xs text-muted">
-                {skill.name}
-              </div>
-            ))}
-          </div>
-          <input
-            value={skillName}
-            onChange={(event) => onNameChange(event.target.value)}
-            className="w-full rounded-md border-line text-xs focus:border-accent focus:ring-accent"
-          />
-          <textarea
-            value={skillContent}
-            onChange={(event) => onContentChange(event.target.value)}
-            rows={7}
-            className="w-full resize-none rounded-md border-line font-mono text-[11px] leading-5 focus:border-accent focus:ring-accent"
-          />
-          <button
-            onClick={onSave}
-            className="flex h-9 w-full items-center justify-center gap-2 rounded-md bg-ink text-sm text-white"
-          >
-            <CheckCircle2 size={15} />
-            Save skill
-          </button>
-        </div>
-      ) : null}
     </div>
   );
 }

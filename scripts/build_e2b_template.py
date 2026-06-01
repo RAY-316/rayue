@@ -15,7 +15,7 @@ from app.config import get_settings
 from app.skills import build_skill_bundle
 
 
-TEMPLATE_NAME = os.environ.get("RAYUE_TEMPLATE_NAME", "rayue-agent-v2")
+TEMPLATE_NAME = os.environ.get("RAYUE_TEMPLATE_NAME")
 BASE_TEMPLATE = os.environ.get("RAYUE_TEMPLATE_BASE", "codex")
 CODEX_PACKAGE = os.environ.get("RAYUE_CODEX_PACKAGE", "@openai/codex@0.135.0")
 
@@ -52,7 +52,9 @@ APT_PACKAGES = [
     "python3-venv",
     "qpdf",
     "ripgrep",
+    "rclone",
     "rsync",
+    "s3fs",
     "shellcheck",
     "sqlite3",
     "tesseract-ocr",
@@ -163,6 +165,7 @@ def main() -> None:
     if not os.environ.get("E2B_API_KEY"):
         raise RuntimeError("E2B_API_KEY is required to build the Rayue sandbox template")
 
+    template_name = TEMPLATE_NAME or settings.e2b_template
     bundle = build_skill_bundle(settings)
     bundle_remote_path = "/tmp/rayue-admin-skills.tar.gz"
     skills_dir = "/home/user/.codex/skills"
@@ -179,22 +182,27 @@ def main() -> None:
         .run_cmd(f"npm install -g --force {sh_single_quote(CODEX_PACKAGE)}")
         .run_cmd(f"npm install -g --force {' '.join(GLOBAL_NODE_PACKAGES)}")
         .run_cmd("python -m playwright install --with-deps chromium")
-        .copy(apply_patch_relative_path, "/tmp/rayue-apply-patch")
+        .copy(apply_patch_relative_path, "/tmp/rayue-apply-patch", force_upload=True, user="root", mode=0o755)
         .run_cmd(
             "set -e; "
             "install -m 0755 /tmp/rayue-apply-patch /usr/local/bin/apply_patch; "
             "ln -sf /usr/bin/fdfind /usr/local/bin/fd; "
             "ln -sf $(command -v python3) /usr/local/bin/python; "
-            "git lfs install --system >/dev/null 2>&1 || true"
+            "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo user_allow_other >> /etc/fuse.conf; "
+            "git lfs install --system >/dev/null 2>&1 || true",
+            user="root",
         )
-        .run_cmd("mkdir -p /home/user/workspace /home/user/.codex/skills && chown -R user:user /home/user")
+        .run_cmd(
+            "mkdir -p /home/user/workspace /home/user/.codex/skills && chown -R user:user /home/user",
+            user="root",
+        )
         .run_cmd(
             "cd /home/user/workspace && "
             "npm init -y >/dev/null 2>&1 && "
             f"npm install {' '.join(WORKSPACE_NODE_PACKAGES)}",
             user="user",
         )
-        .copy(bundle_relative_path, bundle_remote_path)
+        .copy(bundle_relative_path, bundle_remote_path, force_upload=True, user="root")
         .run_cmd(
             "set -e; "
             f"rm -rf {sh_single_quote(skills_dir)}; "
@@ -202,6 +210,7 @@ def main() -> None:
             f"tar -xzf {sh_single_quote(bundle_remote_path)} -C {sh_single_quote(skills_dir)}; "
             f"printf %s {sh_single_quote(bundle.sha256)} > {sh_single_quote(marker_path)}; "
             "chown -R user:user /home/user/.codex /home/user/workspace",
+            user="root",
         )
         .set_envs(
             {
@@ -214,18 +223,18 @@ def main() -> None:
     )
 
     print(
-        f"Building E2B template {TEMPLATE_NAME!r} from {BASE_TEMPLATE!r} "
+        f"Building E2B template {template_name!r} from {BASE_TEMPLATE!r} "
         f"with Codex package {CODEX_PACKAGE!r}, "
         f"{bundle.skill_count} skills and {len(APT_PACKAGES) + len(PYTHON_PACKAGES) + 1 + len(GLOBAL_NODE_PACKAGES) + len(WORKSPACE_NODE_PACKAGES)} packages."
     )
     Template.build(
         template,
-        TEMPLATE_NAME,
+        template_name,
         cpu_count=4,
         memory_mb=4096,
         on_build_logs=default_build_logger(),
     )
-    print(f"Built E2B template: {TEMPLATE_NAME}")
+    print(f"Built E2B template: {template_name}")
 
 
 if __name__ == "__main__":

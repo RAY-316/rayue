@@ -4,11 +4,12 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import admin_skills
 from app.api import artifacts
+from app.api import auth
 from app.api import conversations
 from app.api import health
 from app.api import uploads
+from app.api import workspaces
 from app.api.state import runtime
 from app.api.state import settings
 from app.core.database import init_db
@@ -25,10 +26,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Rayue API", version="0.1.0", lifespan=lifespan)
 app.include_router(health.router)
+app.include_router(auth.router)
+app.include_router(workspaces.router)
 app.include_router(conversations.router)
 app.include_router(artifacts.router)
 app.include_router(uploads.router)
-app.include_router(admin_skills.router)
 app.include_router(convertx_router)
 app.add_middleware(
     CORSMiddleware,

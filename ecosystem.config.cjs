@@ -16,7 +16,7 @@ module.exports = {
       name: "rayue-frontend",
       cwd: "/home/ubuntu/akool/agent_web/rayue-agent/frontend",
       script: "node_modules/next/dist/bin/next",
-      args: "dev -H 0.0.0.0 --hostname 0.0.0.0 --port 8070",
+      args: "start -H 0.0.0.0 --port 8070",
       interpreter: "node",
       autorestart: true,
       max_restarts: 10,

@@ -34,6 +34,9 @@ async def save_uploaded_file(
     settings: Settings,
     conversation_id: str,
     upload: UploadFile,
+    *,
+    existing_bytes: int = 0,
+    max_total_bytes: int | None = None,
 ) -> UploadedFileOut:
     root = _upload_root(settings, conversation_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -50,6 +53,10 @@ async def save_uploaded_file(
                     raise UploadValidationError(
                         f"{upload.filename or 'upload'} exceeds the "
                         f"{_format_upload_limit(settings.max_upload_file_bytes)} per-file limit"
+                    )
+                if max_total_bytes is not None and existing_bytes + written > max_total_bytes:
+                    raise UploadValidationError(
+                        f"{upload.filename or 'upload'} exceeds the workspace storage limit"
                     )
                 file.write(chunk)
     except Exception:

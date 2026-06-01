@@ -42,6 +42,29 @@ def conversation_object_key(
     return f"{prefix}/conversations/{clean_conversation}/{clean_scope}/{clean_relative}"
 
 
+def workspace_object_key(
+    settings: Settings,
+    workspace_id: str,
+    relative_path: str,
+) -> str:
+    prefix = workspace_object_prefix(settings, workspace_id)
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("workspace object path must be relative")
+    clean_relative = _clean_key_part(relative.as_posix())
+    if not clean_relative:
+        raise ValueError("workspace object path must not be empty")
+    return f"{prefix}/{clean_relative}"
+
+
+def workspace_object_prefix(settings: Settings, workspace_id: str) -> str:
+    prefix = _clean_key_part(settings.object_storage_prefix or "rayue-agent")
+    clean_workspace = _clean_key_part(workspace_id)
+    if not clean_workspace:
+        raise ValueError("workspace id must not be empty")
+    return f"{prefix}/workspaces/{clean_workspace}"
+
+
 def content_type_for_path(path: Path | str) -> str:
     guessed = mimetypes.guess_type(str(path))[0]
     return guessed or "application/octet-stream"
@@ -101,6 +124,9 @@ class ObjectStorage:
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=expires_in,
         )
+
+    def delete_object(self, *, key: str) -> None:
+        self._client().delete_object(Bucket=self.bucket, Key=key)
 
 
 def build_object_storage(settings: Settings) -> ObjectStorage | None:

@@ -43,7 +43,11 @@ Future all-in-one features should be added as modules with clear ownership:
 
 Credits must be ledger-based. A turn should reserve credits before execution and settle or refund by `turn_id`; do not directly decrement a balance from the agent runtime.
 
-Files should use database metadata as the source of truth, local disk as hot cache, and R2/object storage as durable storage. Keep upload bundles and artifact bundles so sandbox recovery can fetch one archive instead of many objects.
+Files should use database metadata as the source of truth, local disk as hot cache, and R2/S3-compatible object storage as durable storage. Workspace files are indexed by `workspace_files`; artifacts still record turn/conversation provenance in `artifact_records`.
+
+Sandbox file sharing mounts a workspace-scoped object storage prefix into the sandbox through rclone FUSE and exposes only `inputs/` and `outputs/` inside the Codex cwd. Do not mount over the whole sandbox workspace because the template keeps runtime dependencies such as `node_modules` there. Keep the archive/object-download sync path as compatibility fallback when the mount is disabled or unavailable.
+
+When users reference files with `@`, the frontend must send structured file references, not only text. The backend should validate those references against `workspace_files` and pass exact paths to the agent.
 
 ## Frontend Boundaries
 

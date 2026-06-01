@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 
 from pydantic import BaseModel
@@ -9,6 +11,8 @@ class ConversationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    user_id: str | None = None
+    workspace_id: str | None = None
     title: str
     status: str
     sandbox_id: str | None
@@ -28,6 +32,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     item_id: str | None
+    mentioned_files: list[dict] = Field(default_factory=list)
     created_at: datetime
 
 
@@ -65,10 +70,12 @@ class ConversationDetail(BaseModel):
 
 class CreateConversationRequest(BaseModel):
     title: str | None = None
+    workspace_id: str | None = None
 
 
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1)
+    mentioned_files: list["FileMentionRequest"] = Field(default_factory=list)
 
 
 class SendMessageResponse(BaseModel):
@@ -104,3 +111,125 @@ class UploadedFileOut(BaseModel):
     relative_path: str
     size: int
     modified_at: datetime | None
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: str
+    display_name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AuthStartRequest(BaseModel):
+    email: str
+    display_name: str | None = None
+    captcha_id: str | None = None
+    captcha_answer: str | None = None
+
+
+class AuthVerifyRequest(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+    force: bool = False
+
+
+class PasswordRegisterStartRequest(BaseModel):
+    email: str
+    display_name: str | None = None
+    captcha_id: str | None = None
+    captcha_answer: str | None = None
+
+
+class PasswordRegisterCompleteRequest(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str | None = None
+
+
+class PasswordLoginRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=1)
+    force: bool = False
+
+
+class PasswordResetStartRequest(BaseModel):
+    email: str
+    captcha_id: str | None = None
+    captcha_answer: str | None = None
+
+
+class PasswordResetCompleteRequest(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AuthResponse(BaseModel):
+    user: UserOut
+    token: str
+    expires_at: datetime
+
+
+class EmailCodeResponse(BaseModel):
+    ok: bool = True
+    expires_in_seconds: int
+    code: str | None = None
+
+
+class CaptchaChallengeResponse(BaseModel):
+    captcha_id: str
+    image_data_url: str
+    expires_in_seconds: int
+
+
+class WorkspaceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: str
+    name: str
+    limit_bytes: int
+    used_bytes: int = 0
+    available_bytes: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class CreateWorkspaceRequest(BaseModel):
+    name: str | None = None
+
+
+class UpdateWorkspaceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class WorkspaceFileOut(BaseModel):
+    id: str | None = None
+    name: str
+    path: str
+    relative_path: str
+    kind: str
+    type: str
+    size: int
+    version: int = 1
+    modified_at: datetime | None
+
+
+class FileMentionRequest(BaseModel):
+    file_id: str | None = None
+    relative_path: str | None = None
+    version: int | None = None
+
+
+class FileMentionOut(BaseModel):
+    file_id: str
+    name: str
+    relative_path: str
+    kind: str
+    type: str
+    size: int
+    version: int
