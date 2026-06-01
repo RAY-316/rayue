@@ -98,6 +98,16 @@ Choose colors that match your topic — don't default to generic blue. Use these
 - Icons in small colored circles next to section headers
 - Italic accent text for key stats or taglines
 
+### Images
+
+**Never distort images.** When an image has to fit a different frame, preserve its aspect ratio:
+
+- Use proportional resizing when the full image must remain visible.
+- Use proportional scaling plus cropping when the frame must be filled.
+- Do not set arbitrary width and height values that squeeze or stretch the image.
+- If the frame aspect ratio differs from the image aspect ratio, crop the least important edges instead of compressing the image.
+- After rendering, visually check that people, logos, charts, and product photos are not stretched.
+
 ### Typography
 
 **Choose an interesting font pairing** — don't default to Arial. Pick a header font with personality and pair it with a clean body font.
@@ -135,6 +145,7 @@ Choose colors that match your topic — don't default to generic blue. Use these
 - **Don't mix spacing randomly** — choose 0.3" or 0.5" gaps and use consistently
 - **Don't style one slide and leave the rest plain** — commit fully or keep it simple throughout
 - **Don't create text-only slides** — add images, icons, charts, or visual elements; avoid plain title + bullets
+- **Don't distort images** — preserve aspect ratio; use contain, cover, or crop instead of stretching an image into an arbitrary box
 - **Don't forget text box padding** — when aligning lines or shapes with text edges, set `margin: 0` on the text box or offset the shape to account for padding
 - **Don't use low-contrast elements** — icons AND text need strong contrast against the background; avoid light text on light backgrounds or dark text on dark backgrounds
 - **NEVER use accent lines under titles** — these are a hallmark of AI-generated slides; use whitespace or background color instead
@@ -183,6 +194,7 @@ Look for:
 - Columns or similar elements not aligned consistently
 - Low-contrast text (e.g., light gray text on cream-colored background)
 - Low-contrast icons (e.g., dark icons on dark backgrounds without a contrasting circle)
+- Distorted images from non-proportional scaling; faces, logos, charts, and product shots must keep their natural proportions
 - Text boxes too narrow causing excessive wrapping
 - Leftover placeholder content
 

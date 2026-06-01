@@ -132,6 +132,7 @@ For each slide:
   - Inline labels like (e.g.: "Status:", "Description:") at the start of a line
 - **Never use unicode bullets (•)**: Use proper list formatting with `<a:buChar>` or `<a:buAutoNum>`
 - **Bullet consistency**: Let bullets inherit from the layout. Only specify `<a:buChar>` or `<a:buNone>`.
+- **Never distort replacement images**: Preserve aspect ratio. If the template frame and source image have different aspect ratios, proportionally scale and crop the image rather than stretching it. Keep people, logos, charts, and product photos natural.
 
 ---
 

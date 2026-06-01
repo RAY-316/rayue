@@ -167,6 +167,13 @@ slide.addImage({
 
 ### Image Sizing Modes
 
+Never distort an image by forcing it into arbitrary `w` and `h` values. Preserve aspect ratio:
+
+- Use `contain` when the complete image must be visible.
+- Use `cover` when the image must fill a frame; accept cropping instead of stretching.
+- Use `crop` or calculate proportional dimensions when you need a specific focal area.
+- After rendering, inspect the slide for stretched faces, logos, charts, and product photos.
+
 ```javascript
 // Contain - fit inside, preserve ratio
 { sizing: { type: 'contain', w: 4, h: 3 } }
