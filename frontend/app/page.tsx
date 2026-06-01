@@ -1966,7 +1966,6 @@ export default function Home() {
                     )}
                   >
                     <span>{statusLabel[conversation.status] ?? conversation.status}</span>
-                    <MessageSquarePlus size={14} />
                   </div>
                 </button>
                 <div
