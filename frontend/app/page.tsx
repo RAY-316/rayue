@@ -1906,7 +1906,7 @@ export default function Home() {
   return (
     <main className="flex h-screen min-h-0 bg-[#f2f4f7] text-ink">
       <aside className="flex w-[292px] shrink-0 flex-col border-r border-line bg-white">
-        <div className="flex h-16 items-center justify-between border-b border-line px-4">
+        <div className="flex h-16 items-center border-b border-line px-4">
           <div className="flex items-center gap-2">
             <div className="flex h-9 w-9 items-center justify-center rounded-md bg-ink text-white">
               <Code2 size={18} />
@@ -1916,16 +1916,6 @@ export default function Home() {
               <div className="text-xs text-muted">智能体工作台</div>
             </div>
           </div>
-          <button
-            type="button"
-            className="flex h-9 items-center gap-2 rounded-md border border-line px-3 text-sm hover:bg-panel disabled:cursor-not-allowed disabled:text-muted"
-            onClick={handleNewConversation}
-            disabled={!resolvedWorkspaceId || creatingConversation}
-            title="新对话"
-          >
-            {creatingConversation ? <Loader2 className="animate-spin" size={17} /> : <Plus size={17} />}
-            新对话
-          </button>
         </div>
         <WorkspaceNav
           workspaces={workspaces}
@@ -1934,6 +1924,18 @@ export default function Home() {
           onCreate={() => void handleCreateWorkspace()}
           onRename={(workspace) => void handleRenameWorkspace(workspace)}
         />
+        <div className="border-b border-line bg-white p-3">
+          <button
+            type="button"
+            className="flex h-9 w-full items-center justify-center gap-2 rounded-md bg-ink px-3 text-sm font-medium text-white hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-panel disabled:text-muted"
+            onClick={handleNewConversation}
+            disabled={!resolvedWorkspaceId || creatingConversation}
+            title="新对话"
+          >
+            {creatingConversation ? <Loader2 className="animate-spin" size={16} /> : <MessageSquarePlus size={16} />}
+            新对话
+          </button>
+        </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
           {loading ? (
             <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted">
