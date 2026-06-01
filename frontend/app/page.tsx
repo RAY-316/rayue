@@ -1252,6 +1252,7 @@ export default function Home() {
     () => workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null,
     [activeWorkspaceId, workspaces],
   );
+  const resolvedWorkspaceId = activeWorkspaceId ?? activeConversation?.workspace_id ?? workspaces[0]?.id ?? null;
   const activeStatus = activeConversation?.status ?? "idle";
   const turnBusy = activeStatus === "queued" || activeStatus === "running" || activeStatus === "stopping";
   const stopInProgress = stopping || activeStatus === "stopping";
@@ -1582,7 +1583,8 @@ export default function Home() {
   }, [timelineItems]);
 
   async function handleNewConversation() {
-    const workspaceId = activeWorkspaceIdRef.current;
+    const workspaceId =
+      activeWorkspaceIdRef.current ?? activeWorkspaceId ?? activeConversation?.workspace_id ?? workspaces[0]?.id ?? null;
     if (!workspaceId || creatingConversation) {
       return;
     }
@@ -1590,12 +1592,16 @@ export default function Home() {
       setCreatingConversation(true);
       setError(null);
       const conversation = await createConversation(undefined, workspaceId);
-      if (activeWorkspaceIdRef.current !== workspaceId) {
+      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
         return;
       }
+      activeWorkspaceIdRef.current = workspaceId;
+      setActiveWorkspaceId(workspaceId);
       const nextConversations = [
         conversation,
-        ...conversationsRef.current.filter((item) => item.id !== conversation.id),
+        ...conversationsRef.current.filter(
+          (item) => item.id !== conversation.id && (item.workspace_id ?? null) === workspaceId,
+        ),
       ];
       conversationsRef.current = nextConversations;
       setConversations(nextConversations);
@@ -1912,12 +1918,13 @@ export default function Home() {
           </div>
           <button
             type="button"
-            className="flex h-9 w-9 items-center justify-center rounded-md border border-line hover:bg-panel"
+            className="flex h-9 items-center gap-2 rounded-md border border-line px-3 text-sm hover:bg-panel disabled:cursor-not-allowed disabled:text-muted"
             onClick={handleNewConversation}
-            disabled={!activeWorkspaceId || creatingConversation}
+            disabled={!resolvedWorkspaceId || creatingConversation}
             title="新对话"
           >
             {creatingConversation ? <Loader2 className="animate-spin" size={17} /> : <Plus size={17} />}
+            新对话
           </button>
         </div>
         <WorkspaceNav
@@ -2925,7 +2932,7 @@ function WorkspaceNav({
           title="新建工作区"
         >
           <Plus size={13} />
-          新建
+          工作区
         </button>
       </div>
       <div className="space-y-1">
