@@ -569,8 +569,18 @@ class AgentRuntime:
                 conversation.updated_at = utcnow()
                 await session.commit()
 
-    async def list_artifacts(self, conversation_id: str) -> list[ArtifactOut]:
+    async def list_artifacts(self, conversation_id: str, *, sync: bool = True) -> list[ArtifactOut]:
         await self._ensure_storage_id(conversation_id)
+        if not sync:
+            recorded = await self._list_recorded_artifacts(conversation_id)
+            if recorded:
+                return recorded
+            local = self._list_local_artifacts(conversation_id)
+            if not local:
+                return []
+            attached = await self._attach_artifact_records(conversation_id, local)
+            return await self._filter_conversation_artifacts(conversation_id, attached)
+
         local = self._list_local_artifacts(conversation_id)
         worker = self._workers.get(conversation_id)
         if worker is not None and not worker.closed:
@@ -597,6 +607,30 @@ class AgentRuntime:
         except Exception:
             attached = await self._attach_artifact_records(conversation_id, local)
             return await self._filter_conversation_artifacts(conversation_id, attached)
+
+    async def _list_recorded_artifacts(self, conversation_id: str) -> list[ArtifactOut]:
+        async with SessionLocal() as session:
+            records = (
+                await session.execute(
+                    select(ArtifactRecord).where(ArtifactRecord.conversation_id == conversation_id)
+                )
+            ).scalars().all()
+        return sorted(
+            [
+                ArtifactOut(
+                    name=record.name,
+                    path=record.path,
+                    relative_path=record.relative_path,
+                    type=record.type,
+                    size=record.size,
+                    modified_at=record.modified_at,
+                    turn_id=record.turn_id,
+                    first_seen_at=record.first_seen_at,
+                )
+                for record in records
+            ],
+            key=_artifact_sort_key,
+        )
 
     async def read_artifact(self, conversation_id: str, path: str) -> tuple[bytes, str]:
         await self._ensure_storage_id(conversation_id)

@@ -89,6 +89,14 @@ const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const PROCESS_DETAIL_LIMIT = 360;
 const MAX_EVENT_HISTORY = 3000;
 const INLINE_ARTIFACT_LIMIT = 12;
+const WORKSPACE_FILE_CACHE_TTL_MS = 30_000;
+
+type LoadActiveOptions = {
+  includeFiles?: boolean;
+  awaitFiles?: boolean;
+  artifactSync?: boolean;
+  refreshWorkspaceSummary?: boolean;
+};
 
 function messageFromApi(message: Message): LocalMessage {
   return {
@@ -1240,6 +1248,10 @@ export default function Home() {
   const activeWorkspaceIdRef = useRef<string | null>(null);
   const conversationsRef = useRef<Conversation[]>([]);
   const activeStatusRef = useRef("idle");
+  const artifactCacheRef = useRef(new Map<string, Artifact[]>());
+  const uploadCacheRef = useRef(new Map<string, UploadedFile[]>());
+  const workspaceFileCacheRef = useRef(new Map<string, WorkspaceFile[]>());
+  const workspaceFileCacheTimeRef = useRef(new Map<string, number>());
   const stickToBottomRef = useRef(false);
   const forceScrollBottomRef = useRef(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
@@ -1295,6 +1307,7 @@ export default function Home() {
   }, []);
 
   const switchConversation = useCallback((conversationId: string | null) => {
+    const workspaceId = activeWorkspaceIdRef.current;
     activeIdRef.current = conversationId;
     activeStatusRef.current =
       conversationsRef.current.find((conversation) => conversation.id === conversationId)?.status ?? "idle";
@@ -1302,8 +1315,9 @@ export default function Home() {
     setMessages([]);
     setEvents([]);
     setTurns([]);
-    setArtifacts([]);
-    setUploads([]);
+    setArtifacts(conversationId ? artifactCacheRef.current.get(conversationId) ?? [] : []);
+    setUploads(conversationId ? uploadCacheRef.current.get(conversationId) ?? [] : []);
+    setWorkspaceFiles(workspaceId ? workspaceFileCacheRef.current.get(workspaceId) ?? [] : []);
     setError(null);
     setStopping(false);
     stickToBottomRef.current = false;
@@ -1349,6 +1363,8 @@ export default function Home() {
       return [];
     }
     const rows = await listWorkspaceFiles(workspaceId);
+    workspaceFileCacheRef.current.set(workspaceId, rows);
+    workspaceFileCacheTimeRef.current.set(workspaceId, Date.now());
     setWorkspaceFiles(rows);
     void refreshWorkspaces().catch(() => undefined);
     return rows;
@@ -1363,14 +1379,55 @@ export default function Home() {
     stickToBottomRef.current = distanceToBottom < 120;
   }, []);
 
-  const loadActive = useCallback(async (conversationId: string, mode: "replace" | "merge" = "merge") => {
-    const workspaceId = activeWorkspaceIdRef.current;
-    const [detail, artifactRows, uploadRows, workspaceFileRows] = await Promise.all([
-      getConversation(conversationId),
-      listArtifacts(conversationId).catch(() => [] as Artifact[]),
-      listUploads(conversationId).catch(() => [] as UploadedFile[]),
-      workspaceId ? listWorkspaceFiles(workspaceId).catch(() => [] as WorkspaceFile[]) : Promise.resolve([] as WorkspaceFile[]),
+  const loadActiveFiles = useCallback(async (
+    conversationId: string,
+    workspaceId = activeWorkspaceIdRef.current,
+    options: Pick<LoadActiveOptions, "artifactSync" | "refreshWorkspaceSummary"> = {},
+  ) => {
+    const cachedWorkspaceFiles = workspaceId ? workspaceFileCacheRef.current.get(workspaceId) ?? null : null;
+    const cachedAt = workspaceId ? workspaceFileCacheTimeRef.current.get(workspaceId) ?? 0 : 0;
+    const shouldRefreshWorkspaceFiles =
+      !!workspaceId &&
+      (options.refreshWorkspaceSummary ||
+        !cachedWorkspaceFiles ||
+        Date.now() - cachedAt > WORKSPACE_FILE_CACHE_TTL_MS);
+    const [artifactRows, uploadRows, workspaceFileRows] = await Promise.all([
+      listArtifacts(conversationId, { sync: options.artifactSync ?? false }).catch(() => null),
+      listUploads(conversationId).catch(() => null),
+      shouldRefreshWorkspaceFiles && workspaceId
+        ? listWorkspaceFiles(workspaceId).catch(() => null)
+        : Promise.resolve(cachedWorkspaceFiles),
     ]);
+    if (!isActiveConversation(conversationId)) {
+      return;
+    }
+    if (artifactRows !== null) {
+      artifactCacheRef.current.set(conversationId, artifactRows);
+      setArtifacts(artifactRows);
+    }
+    if (uploadRows !== null) {
+      uploadCacheRef.current.set(conversationId, uploadRows);
+      setUploads(uploadRows);
+    }
+    if (workspaceId && workspaceFileRows !== null && workspaceId === activeWorkspaceIdRef.current) {
+      workspaceFileCacheRef.current.set(workspaceId, workspaceFileRows);
+      if (shouldRefreshWorkspaceFiles) {
+        workspaceFileCacheTimeRef.current.set(workspaceId, Date.now());
+      }
+      setWorkspaceFiles(workspaceFileRows);
+    }
+    if (options.refreshWorkspaceSummary) {
+      void refreshWorkspaces().catch(() => undefined);
+    }
+  }, [isActiveConversation, refreshWorkspaces]);
+
+  const loadActive = useCallback(async (
+    conversationId: string,
+    mode: "replace" | "merge" = "merge",
+    options: LoadActiveOptions = {},
+  ) => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    const detail = await getConversation(conversationId);
     if (!isActiveConversation(conversationId)) {
       return;
     }
@@ -1378,15 +1435,24 @@ export default function Home() {
     setMessages((prev) => (mode === "replace" ? apiMessages : mergeMessages(prev, apiMessages)));
     setEvents((prev) => (mode === "replace" ? detail.events : mergeEvents(prev, detail.events)));
     setTurns(detail.turns);
-    setArtifacts(artifactRows);
-    setUploads(uploadRows);
-    setWorkspaceFiles(workspaceFileRows);
+    activeStatusRef.current = detail.conversation.status;
     setConversations((prev) =>
       prev.map((conversation) =>
         conversation.id === detail.conversation.id ? detail.conversation : conversation,
       ),
     );
-  }, [activeWorkspaceId, isActiveConversation]);
+    if (options.includeFiles ?? true) {
+      const filesPromise = loadActiveFiles(conversationId, workspaceId, {
+        artifactSync: options.artifactSync ?? false,
+        refreshWorkspaceSummary: options.refreshWorkspaceSummary,
+      });
+      if (options.awaitFiles) {
+        await filesPromise;
+      } else {
+        void filesPromise.catch(() => undefined);
+      }
+    }
+  }, [isActiveConversation, loadActiveFiles]);
 
   useEffect(() => {
     async function bootAuth() {
@@ -1440,6 +1506,8 @@ export default function Home() {
           conversationsRef.current = rows;
           switchConversation(rows[0].id);
         }
+        workspaceFileCacheRef.current.set(workspace.id, fileRows);
+        workspaceFileCacheTimeRef.current.set(workspace.id, Date.now());
         setWorkspaceFiles(fileRows);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load app");
@@ -1463,7 +1531,7 @@ export default function Home() {
     const source = new EventSource(conversationEventsUrl(conversationId));
     let reconnectRefresh: ReturnType<typeof setTimeout> | null = null;
     const refreshActive = () => {
-      void loadActive(conversationId).catch(() => undefined);
+      void loadActive(conversationId, "merge", { includeFiles: false }).catch(() => undefined);
     };
     const fallbackPoll = window.setInterval(() => {
       if (
@@ -1474,9 +1542,6 @@ export default function Home() {
         refreshActive();
       }
     }, 3000);
-    source.onopen = () => {
-      refreshActive();
-    };
     source.onmessage = (messageEvent) => {
       const event = JSON.parse(messageEvent.data) as AgentEvent;
       if (!isActiveConversation(conversationId)) {
@@ -1532,8 +1597,9 @@ export default function Home() {
         }
       }
       if (event.type === "artifacts_updated" || event.type === "turn_completed") {
-        void listArtifacts(conversationId)
+        void listArtifacts(conversationId, { sync: false })
           .then((rows) => {
+            artifactCacheRef.current.set(conversationId, rows);
             if (isActiveConversation(conversationId)) {
               setArtifacts(rows);
             }
@@ -1544,6 +1610,7 @@ export default function Home() {
       if (event.type === "uploads_updated" || event.type === "input_files_synced") {
         void listUploads(conversationId)
           .then((rows) => {
+            uploadCacheRef.current.set(conversationId, rows);
             if (isActiveConversation(conversationId)) {
               setUploads(rows);
             }
@@ -1625,6 +1692,8 @@ export default function Home() {
     }
     try {
       await deleteConversation(conversationId);
+      artifactCacheRef.current.delete(conversationId);
+      uploadCacheRef.current.delete(conversationId);
       let next = conversations.filter((item) => item.id !== conversationId);
       if (next.length === 0 && activeWorkspaceId) {
         const created = await createConversation(undefined, activeWorkspaceId);
@@ -1746,10 +1815,17 @@ export default function Home() {
     );
     try {
       await stopConversation(activeId);
-      await Promise.all([loadActive(activeId), refreshConversations()]);
+      await Promise.all([
+        loadActive(activeId, "merge", {
+          awaitFiles: true,
+          artifactSync: true,
+          refreshWorkspaceSummary: true,
+        }),
+        refreshConversations(),
+      ]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to stop task");
-      void loadActive(activeId).catch(() => undefined);
+      void loadActive(activeId, "merge", { includeFiles: false }).catch(() => undefined);
     } finally {
       setStopping(false);
     }
@@ -1774,6 +1850,7 @@ export default function Home() {
     setError(null);
     try {
       const rows = await uploadFiles(conversationId, selected);
+      uploadCacheRef.current.set(conversationId, rows);
       if (isActiveConversation(conversationId)) {
         setUploads(rows);
         void refreshWorkspaceFiles().catch(() => undefined);
@@ -1807,6 +1884,10 @@ export default function Home() {
     setActiveWorkspaceId(null);
     setWorkspaceFiles([]);
     setConversations([]);
+    artifactCacheRef.current.clear();
+    uploadCacheRef.current.clear();
+    workspaceFileCacheRef.current.clear();
+    workspaceFileCacheTimeRef.current.clear();
     switchConversation(null);
   }
 
@@ -1833,6 +1914,8 @@ export default function Home() {
         conversationsRef.current = rows;
         switchConversation(rows[0].id);
       }
+      workspaceFileCacheRef.current.set(workspaceId, files);
+      workspaceFileCacheTimeRef.current.set(workspaceId, Date.now());
       setWorkspaceFiles(files);
       void refreshWorkspaces().catch(() => undefined);
     } catch (err) {
@@ -1881,7 +1964,7 @@ export default function Home() {
       await deleteWorkspaceFile(activeWorkspaceId, path);
       await refreshWorkspaceFiles(activeWorkspaceId);
       if (activeId) {
-        await loadActive(activeId);
+        await loadActive(activeId, "merge", { awaitFiles: true, artifactSync: false });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete file");
@@ -2016,7 +2099,14 @@ export default function Home() {
             </div>
           </div>
           <button
-            onClick={() => activeId && loadActive(activeId)}
+            onClick={() =>
+              activeId &&
+              loadActive(activeId, "merge", {
+                awaitFiles: true,
+                artifactSync: true,
+                refreshWorkspaceSummary: true,
+              })
+            }
             className="flex h-9 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm hover:bg-panel"
           >
             <RefreshCw size={15} />

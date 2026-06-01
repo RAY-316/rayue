@@ -375,8 +375,9 @@ export function putSkill(name: string, content: string) {
   });
 }
 
-export function listArtifacts(conversationId: string) {
-  return request<Artifact[]>(`/api/conversations/${conversationId}/artifacts`);
+export function listArtifacts(conversationId: string, options: { sync?: boolean } = {}) {
+  const query = options.sync === false ? "?sync=false" : "";
+  return request<Artifact[]>(`/api/conversations/${conversationId}/artifacts${query}`);
 }
 
 export function artifactDownloadUrl(conversationId: string, path: string) {

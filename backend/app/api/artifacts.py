@@ -24,6 +24,7 @@ router = APIRouter()
 @router.get("/api/conversations/{conversation_id}/artifacts", response_model=list[ArtifactOut])
 async def list_artifacts(
     conversation_id: str,
+    sync: bool = Query(True),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ArtifactOut]:
@@ -31,7 +32,7 @@ async def list_artifacts(
     if not conversation or conversation.user_id != user.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
     try:
-        return await runtime.list_artifacts(conversation_id)
+        return await runtime.list_artifacts(conversation_id, sync=sync)
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
