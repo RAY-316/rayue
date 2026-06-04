@@ -136,10 +136,43 @@ To cast a shadow upward (e.g. on a footer bar), use `angle: 270` with a positive
 
 ## Images
 
+### Hard Rule: Never Stretch Photos/Product Images
+
+Bare `slide.addImage({ path, x, y, w, h })` stretches the bitmap to the requested frame. Do not use it for photos, product shots, screenshots, charts, portraits, logos, or any user-visible visual unless the image has already been cropped/resized to exactly the same aspect ratio as the frame.
+
+Use the bundled helper instead:
+
+```javascript
+const pptxgen = require("pptxgenjs");
+const { addImageContain, addImageCover } = require("./scripts/pptx_image_fit");
+
+// Complete image visible, ratio preserved
+await addImageContain(slide, {
+  imagePath: "car.jpg",
+  x: 6.4, y: 0.5, w: 3.0, h: 4.8,
+});
+
+// Frame filled, ratio preserved via pre-crop
+await addImageCover(slide, {
+  imagePath: "car.jpg",
+  x: 6.4, y: 0.5, w: 3.0, h: 4.8,
+  position: "centre", // sharp position: centre, top, bottom, left, right, etc.
+});
+```
+
+After writing the deck, run:
+
+```bash
+python scripts/check_image_aspect.py output.pptx
+```
+
+If the checker reports a slide, fix that slide before delivering.
+
 ### Image Sources
 
 ```javascript
 // From file path
+// OK only if the image ratio already matches 5:3; otherwise use addImageContain/addImageCover.
 slide.addImage({ path: "images/chart.png", x: 1, y: 1, w: 5, h: 3 });
 
 // From URL
@@ -169,6 +202,7 @@ slide.addImage({
 
 Never distort an image by forcing it into arbitrary `w` and `h` values. Preserve aspect ratio:
 
+- Prefer `addImageContain` and `addImageCover` from `scripts/pptx_image_fit.js`; they work without relying on ambiguous library sizing behavior.
 - Use `contain` when the complete image must be visible.
 - Use `cover` when the image must fill a frame; accept cropping instead of stretching.
 - Use `crop` or calculate proportional dimensions when you need a specific focal area.
@@ -176,10 +210,10 @@ Never distort an image by forcing it into arbitrary `w` and `h` values. Preserve
 
 ```javascript
 // Contain - fit inside, preserve ratio
-{ sizing: { type: 'contain', w: 4, h: 3 } }
+await addImageContain(slide, { imagePath: "image.png", x: 1, y: 1, w: 4, h: 3 });
 
-// Cover - fill area, preserve ratio (may crop)
-{ sizing: { type: 'cover', w: 4, h: 3 } }
+// Cover - fill area, preserve ratio by pre-cropping (may crop)
+await addImageCover(slide, { imagePath: "image.png", x: 1, y: 1, w: 4, h: 3 });
 
 // Crop - cut specific portion
 { sizing: { type: 'crop', x: 0.5, y: 0.5, w: 2, h: 2 } }
@@ -415,6 +449,8 @@ titleSlide.addText("My Title", { placeholder: "title" });
    slide.addShape(pres.shapes.RECTANGLE, { x: 1, y: 1, w: 3, h: 1.5, fill: { color: "FFFFFF" } });
    slide.addShape(pres.shapes.RECTANGLE, { x: 1, y: 1, w: 0.08, h: 1.5, fill: { color: "0891B2" } });
    ```
+
+9. **Never stretch images** - do not use bare `addImage({ path, x, y, w, h })` for user-visible images unless the image has already been cropped to the exact frame aspect ratio. Use `addImageContain`/`addImageCover` and run `python scripts/check_image_aspect.py output.pptx`.
 
 ---
 

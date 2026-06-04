@@ -73,6 +73,10 @@ class CreateConversationRequest(BaseModel):
     workspace_id: str | None = None
 
 
+class UpdateConversationRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1)
     mentioned_files: list["FileMentionRequest"] = Field(default_factory=list)
@@ -80,6 +84,8 @@ class SendMessageRequest(BaseModel):
 
 class SendMessageResponse(BaseModel):
     message: MessageOut
+    turn: AgentTurnOut
+    conversation: ConversationOut
 
 
 class SkillOut(BaseModel):

@@ -1,4 +1,5 @@
 import json
+import re
 from typing import AsyncIterator
 
 from fastapi import APIRouter
@@ -35,12 +36,139 @@ from app.domain.schemas import EventOut
 from app.domain.schemas import MessageOut
 from app.domain.schemas import SendMessageRequest
 from app.domain.schemas import SendMessageResponse
+from app.domain.schemas import UpdateConversationRequest
 from app.files.workspace_index import WorkspaceFileIndexError
 from app.files.workspace_index import render_mentioned_file_context
 from app.files.workspace_index import resolve_file_mentions
 
 
 router = APIRouter()
+DEFAULT_CONVERSATION_TITLE = "新对话"
+DEFAULT_CONVERSATION_TITLES = {DEFAULT_CONVERSATION_TITLE, "New conversation", ""}
+LEGACY_BUGGY_CONVERSATION_TITLES = {"PPT 图片比例修复"}
+TITLE_MAX_LENGTH = 18
+
+
+def _is_default_conversation_title(title: str | None) -> bool:
+    return (title or "").strip() in DEFAULT_CONVERSATION_TITLES
+
+
+def _should_autogenerate_conversation_title(title: str | None) -> bool:
+    stripped = (title or "").strip()
+    return stripped in DEFAULT_CONVERSATION_TITLES or stripped in LEGACY_BUGGY_CONVERSATION_TITLES
+
+
+def _clean_title_source(content: str) -> str:
+    text = re.sub(r"```.*?```", " ", content, flags=re.S)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"@\S+", " ", text)
+    text = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", text)
+    text = re.sub(r"[/\\][\w./\\ -]+", " ", text)
+    text = re.sub(r"\b(?:outputs|inputs|storage|work|tmp)\S*", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"^(帮我|麻烦|请|能不能|可以|看看|看下|分析一下|仔细分析|现在|另外|为啥|为什么|怎么|如何|这个|那个|我的)+",
+        "",
+        text,
+    ).strip()
+    return text
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    lower = text.lower()
+    return any(keyword.lower() in lower for keyword in keywords)
+
+
+def _fallback_title(text: str) -> str:
+    text = re.sub(r"[#*_`~|<>]", "", text)
+    text = re.sub(r"[。！？!?；;，,：:]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return DEFAULT_CONVERSATION_TITLE
+    words = text.split()
+    if len(words) > 1 and all(ord(char) < 128 for char in text):
+        title = " ".join(words[:4])
+    else:
+        title = text[:TITLE_MAX_LENGTH]
+    return title.strip() or DEFAULT_CONVERSATION_TITLE
+
+
+def _compact_title_fragment(text: str) -> str:
+    text = re.sub(r"[\"'“”‘’#*_`~|<>]", " ", text)
+    text = re.sub(r"[，。！？!?；;：:\n]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"^(帮我|麻烦|请|能不能|可以|看看|看下|做个|做一个|制作|生成|创建|写一个|关于|有关|主题是|主题为|一个|一份|一套)+",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.split(r"(?:pptx?|deck|slides?|幻灯片|演示文稿)", text, maxsplit=1, flags=re.I)[0].strip()
+    text = re.sub(r"(的|相关|介绍|最好|需要|要求)$", "", text, flags=re.I).strip()
+    return text
+
+
+def _ppt_subject_title(text: str) -> str | None:
+    subject = None
+    topic_match = re.search(r"(?:关于|有关|主题是|主题为)\s*([^，。！？!?；;：:\n]{2,40})", text, flags=re.I)
+    if topic_match:
+        subject = topic_match.group(1)
+    else:
+        before_ppt = re.split(r"(?:pptx?|deck|slides?|幻灯片|演示文稿)", text, maxsplit=1, flags=re.I)[0]
+        subject = before_ppt
+    subject = _compact_title_fragment(subject or "")
+    if not subject or subject.lower() in {"ppt", "pptx", "deck", "slide"}:
+        return None
+    subject = re.sub(r"\s*的$", "", subject).strip()
+    if len(subject) < 2:
+        return None
+    return f"{subject[:12]} PPT"[:TITLE_MAX_LENGTH]
+
+
+def _auto_conversation_title(content: str) -> str:
+    text = _clean_title_source(content)
+    if not text:
+        return DEFAULT_CONVERSATION_TITLE
+
+    if _contains_any(text, ("ppt", "pptx", "幻灯片", "演示文稿", "deck", "slide")):
+        if _contains_any(text, ("压缩", "变形", "拉伸", "面包", "比例", "失真", "挤压", "挤成")):
+            return "PPT 图片比例修复"
+        if _contains_any(text, ("修改", "编辑", "调整", "优化", "修")):
+            return "PPT 修改优化"
+        return _ppt_subject_title(text) or "PPT 制作"
+
+    if _contains_any(text, ("标题", "重命名", "新对话")):
+        return "对话标题优化"
+
+    if _contains_any(text, ("429", "key", "api key", "llm", "rate limit", "限流", "额度")):
+        return "LLM 调用排查"
+
+    if _contains_any(text, ("生图", "生成图片", "画图", "图片生成", "gpt image", "gpt-image")):
+        return "图片生成"
+
+    if _contains_any(text, ("前端", "页面", "按钮", "侧边栏", "ui", "样式", "渲染", "滚动")):
+        if _contains_any(text, ("bug", "报错", "失败", "卡", "不显示", "问题")):
+            return "前端问题排查"
+        return "前端界面调整"
+
+    if _contains_any(text, ("skill", "技能", "约束", "prompt")):
+        return "Skill 约束优化"
+
+    if _contains_any(text, ("新闻", "最新", "今天", "今日")):
+        if _contains_any(text, ("科技", "ai", "人工智能")):
+            return "科技新闻查询"
+        return "新闻查询"
+
+    if _contains_any(text, ("查询", "搜索", "查一下", "找一下")):
+        return f"{_fallback_title(text).rstrip('查询搜索 ')}查询"[:TITLE_MAX_LENGTH]
+
+    if _contains_any(text, ("bug", "报错", "失败", "卡住", "不显示", "异常", "问题")):
+        return f"{_fallback_title(text).rstrip('问题排查 ')}问题排查"[:TITLE_MAX_LENGTH]
+
+    if _contains_any(text, ("生成", "创建", "做一个", "写一个", "实现", "开发")):
+        return f"{_fallback_title(text).rstrip('生成制作 ')}生成"[:TITLE_MAX_LENGTH]
+
+    return _fallback_title(text)
 
 
 @router.get("/api/conversations", response_model=list[ConversationOut])
@@ -72,7 +200,7 @@ async def create_conversation(
     else:
         workspace = await ensure_default_workspace(session, settings, user)
     conversation = Conversation(
-        title=body.title or "New conversation",
+        title=(body.title or DEFAULT_CONVERSATION_TITLE).strip()[:120] or DEFAULT_CONVERSATION_TITLE,
         user_id=user.id,
         workspace_id=workspace.id,
     )
@@ -112,6 +240,26 @@ async def get_conversation(
         events=[EventOut.model_validate(event) for event in events],
         turns=[AgentTurnOut.model_validate(turn) for turn in turns],
     )
+
+
+@router.patch("/api/conversations/{conversation_id}", response_model=ConversationOut)
+async def update_conversation(
+    conversation_id: str,
+    body: UpdateConversationRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ConversationOut:
+    conversation = await session.get(Conversation, conversation_id)
+    if not conversation or conversation.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    conversation.title = title[:120]
+    conversation.updated_at = utcnow()
+    await session.commit()
+    await session.refresh(conversation)
+    return ConversationOut.model_validate(conversation)
 
 
 @router.delete("/api/conversations/{conversation_id}", status_code=204)
@@ -163,13 +311,20 @@ async def send_message(
     except WorkspaceFileIndexError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     mentioned_payload = [file.model_dump(mode="json") for file in mentioned_files]
+    if _should_autogenerate_conversation_title(conversation.title):
+        first_user_content = await session.scalar(
+            select(Message.content)
+            .where(Message.conversation_id == conversation_id, Message.role == "user")
+            .order_by(Message.created_at)
+            .limit(1)
+        )
+        conversation.title = _auto_conversation_title(first_user_content or body.content)
     message = Message(
         conversation_id=conversation_id,
         role="user",
         content=body.content,
         mentioned_files=mentioned_payload,
     )
-    conversation.title = conversation.title if conversation.title != "New conversation" else body.content[:80]
     conversation.status = "queued"
     conversation.last_activity_at = utcnow()
     conversation.updated_at = utcnow()
@@ -185,12 +340,17 @@ async def send_message(
     session.add(turn)
     await session.commit()
     await session.refresh(message)
+    await session.refresh(conversation)
     runtime.schedule_turn(
         conversation_id,
         body.content + render_mentioned_file_context(mentioned_files),
         turn.id,
     )
-    return SendMessageResponse(message=MessageOut.model_validate(message))
+    return SendMessageResponse(
+        message=MessageOut.model_validate(message),
+        turn=AgentTurnOut.model_validate(turn),
+        conversation=ConversationOut.model_validate(conversation),
+    )
 
 
 @router.post("/api/conversations/{conversation_id}/stop", status_code=204)

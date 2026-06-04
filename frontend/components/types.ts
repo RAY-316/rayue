@@ -4,5 +4,4 @@ export type LocalMessage = {
   content: string;
   itemId?: string | null;
   createdAt?: string;
-  pending?: boolean;
 };

@@ -326,6 +326,13 @@ export function createConversation(title?: string, workspaceId?: string | null) 
   });
 }
 
+export function updateConversationTitle(id: string, title: string) {
+  return request<Conversation>(`/api/conversations/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+}
+
 export async function deleteConversation(id: string) {
   const response = await fetch(`${getApiBase()}/api/conversations/${id}`, {
     method: "DELETE",
@@ -341,7 +348,7 @@ export function getConversation(id: string) {
 }
 
 export function sendMessage(conversationId: string, content: string, mentionedFiles: WorkspaceFile[] = []) {
-  return request<{ message: Message }>(`/api/conversations/${conversationId}/messages`, {
+  return request<{ message: Message; turn: AgentTurn; conversation: Conversation }>(`/api/conversations/${conversationId}/messages`, {
     method: "POST",
     body: JSON.stringify({
       content,

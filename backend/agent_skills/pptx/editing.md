@@ -133,6 +133,8 @@ For each slide:
 - **Never use unicode bullets (•)**: Use proper list formatting with `<a:buChar>` or `<a:buAutoNum>`
 - **Bullet consistency**: Let bullets inherit from the layout. Only specify `<a:buChar>` or `<a:buNone>`.
 - **Never distort replacement images**: Preserve aspect ratio. If the template frame and source image have different aspect ratios, proportionally scale and crop the image rather than stretching it. Keep people, logos, charts, and product photos natural.
+- **Do not only change `<a:ext cx cy>` for a replacement image** when the source ratio differs from the frame. Either add crop metadata (`<a:srcRect>`) or pre-crop the image asset to the target frame ratio before replacing the relationship target.
+- After editing a deck with replacement images, run `python scripts/check_image_aspect.py output.pptx`; any reported slide needs a crop/contain fix before delivery.
 
 ---
 

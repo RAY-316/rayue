@@ -1,6 +1,6 @@
 ---
 name: gpt-image-2
-description: Private GPT Image 2 wrapper for text-to-image and image-to-image/edit workflows through the user's sub2api endpoint. Use when Codex needs to generate images from prompts, edit uploaded/local images with multipart image[] inputs, test the image API, decode b64_json outputs, or create project image assets with model gpt-image-2.
+description: Primary private GPT Image 2 wrapper for text-to-image and image-to-image/edit workflows through the user's sub2api endpoint. Prefer this skill for any user image generation, image editing, visual asset creation, or image API testing intent unless the user explicitly asks for another provider/tool or the task is better done as code/vector. Uses model gpt-image-2 and decodes b64_json outputs.
 ---
 
 # GPT Image 2
@@ -13,7 +13,10 @@ The bundled script keeps the base URL and API key local to this skill and wraps:
 - text-to-image: `POST /v1/images/generations`
 - image-to-image/edit: `POST /v1/images/edits` with multipart `image[]=@file`
 
-Default to `quality=low` and `moderation=low` for speed unless the user asks for higher quality.
+Treat user requests to create, generate, draw, render, design, edit, enhance, transform, restyle, or recreate images as image generation/editing intent, and use this skill first.
+If the user asks why a prior image task did not use GPT Image 2 or this skill, and the conversation still expects an image result, use this skill to create the image instead of only explaining the tool choice.
+Default to `quality=low` and `moderation=low` unless the user explicitly asks for higher quality, stricter/automatic moderation, or a different provider/tool.
+Image generation commonly takes 60-180 seconds; wait for the request to finish and keep the script timeout long enough.
 Do not pass `background=transparent`; GPT Image 2 only supports `auto` or `opaque`.
 Use Chinese prompts by default when the user is working in Chinese or has not requested another prompt language.
 
@@ -35,7 +38,7 @@ python3 "$CODEX_HOME/skills/gpt-image-2/scripts/gpt_image2.py" edit \
   --image /absolute/path/input.png \
   --prompt "给这张图片里的女生戴上一顶自然合适的黑色贝雷帽，保持其他内容不变" \
   --size 1024x1536 \
-  --quality medium \
+  --quality low \
   --output /tmp/edited.png
 ```
 
@@ -72,6 +75,7 @@ The script also supports environment overrides:
 - `GPT_IMAGE2_API_KEY`
 - `GPT_IMAGE2_GENERATE_PATH`
 - `GPT_IMAGE2_EDIT_PATH`
+- `GPT_IMAGE2_TIMEOUT_SECONDS`
 
 ## Marketplace Backup Endpoint
 
@@ -111,7 +115,7 @@ python3 "$CODEX_HOME/skills/gpt-image-2/scripts/gpt_image2.py" edit \
   --image /absolute/path/input.png \
   --prompt "给这张图片里的女生戴上一顶自然合适的黑色贝雷帽，保持其他内容不变" \
   --size 1024x1536 \
-  --quality medium \
+  --quality low \
   --output /tmp/edited.png
 ```
 
@@ -135,5 +139,5 @@ python3 "$CODEX_HOME/skills/gpt-image-2/scripts/gpt_image2.py" edit \
 - For 9:16 vertical video, prefer `1024x1536` unless the endpoint supports an exact 9:16 size.
 - For 16:9 horizontal video, prefer `1536x1024` unless the endpoint supports an exact 16:9 size.
 - For 1:1 square video, use `1024x1024`.
-- For storyboard overview / base storyboard sheet assets, choose the sheet layout that best supports planning readability. A professional production storyboard board is usually horizontal, so prefer `1536x1024` and `quality=high` even when the final video is vertical.
+- For storyboard overview / base storyboard sheet assets, choose the sheet layout that best supports planning readability. A professional production storyboard board is usually horizontal, so prefer `1536x1024`; still keep `quality=low` unless the user explicitly asks for higher quality.
 - Keep the key private. This skill is local-only and should not be published or committed to a public repo.

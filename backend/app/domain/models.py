@@ -114,7 +114,7 @@ class Conversation(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("conv"))
     user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     workspace_id: Mapped[str | None] = mapped_column(ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True)
-    title: Mapped[str] = mapped_column(String(240), default="New conversation")
+    title: Mapped[str] = mapped_column(String(240), default="新对话")
     status: Mapped[str] = mapped_column(String(40), default="idle")
     sandbox_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     codex_thread_id: Mapped[str | None] = mapped_column(String(120), nullable=True)

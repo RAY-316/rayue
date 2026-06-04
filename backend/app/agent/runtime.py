@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shutil
 import shlex
@@ -40,6 +41,9 @@ from app.files.uploads import is_uploaded_input_path
 from app.files.uploads import render_upload_context
 from app.files.uploads import resolve_uploaded_file_path
 from app.files.workspaces import workspace_usage_bytes
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntimeError(RuntimeError):
@@ -180,12 +184,16 @@ REMOTE_LONG_OPERATION_TIMEOUT_SECONDS = 600
 SHORT_REMOTE_COMMAND_TIMEOUT_SECONDS = 120
 TURN_COMPLETION_TIMEOUT_SECONDS = 7200
 TURN_PROGRESS_HEARTBEAT_SECONDS = 30
-POST_COMMAND_SILENCE_RECOVERY_SECONDS = 300
+TURN_FAILURE_RETRY_COUNT = 2
+TURN_FAILURE_RETRY_DELAY_SECONDS = 5
+POST_COMMAND_SILENCE_RECOVERY_SECONDS = 600
 POST_AGENT_MESSAGE_SILENCE_RECOVERY_SECONDS = 180
 MODEL_SILENCE_RECOVERY_SECONDS = 900
+NETWORK_TOOL_SILENCE_RECOVERY_SECONDS = 60
 TURN_RECOVERY_READ_TIMEOUT_SECONDS = 30
 TURN_INTERRUPT_TIMEOUT_SECONDS = 30
 WORKSPACE_MOUNT_REFRESH_MARGIN_SECONDS = 900
+NETWORK_TOOL_ITEM_TYPES = frozenset({"webSearch"})
 
 
 def _event_payload(event: AgentEvent) -> dict[str, Any]:
@@ -196,6 +204,169 @@ def _event_payload(event: AgentEvent) -> dict[str, Any]:
         "payload": event.payload,
         "created_at": event.created_at.isoformat(),
     }
+
+
+def _enrich_event_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(payload)
+    if event_type in {"item_started", "item_completed"}:
+        item = enriched.get("item")
+        if isinstance(item, dict):
+            process_item = _process_item_from_raw_event(event_type, item)
+            if process_item is not None:
+                enriched.setdefault("itemId", process_item["id"])
+                phase = process_item.get("phase")
+                if isinstance(phase, str):
+                    enriched.setdefault("phase", phase)
+                enriched["processItem"] = process_item
+    elif event_type == "reasoning_delta":
+        item_id = _first_string(enriched, "itemId", "item_id") or "reasoning"
+        enriched["processItem"] = {
+            "id": item_id,
+            "kind": "reasoning",
+            "status": "running",
+            "title": "思考中..",
+        }
+    elif event_type == "assistant_message":
+        item_id = _first_string(enriched, "item_id", "itemId") or "assistant-message"
+        enriched.setdefault("phase", "final_answer")
+        enriched["processItem"] = {
+            "id": item_id,
+            "kind": "assistant_message",
+            "status": "completed",
+            "title": "已生成回复",
+            "phase": "final_answer",
+        }
+    return enriched
+
+
+def _process_item_from_raw_event(event_type: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    raw_type = item.get("type")
+    if not isinstance(raw_type, str):
+        return None
+    kind = _process_kind_from_item_type(raw_type)
+    if kind is None:
+        return None
+    item_id = _first_string(item, "id", "callId", "call_id") or f"{kind}-{hashlib.sha1(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()[:12]}"
+    status = "running" if event_type == "item_started" else _completed_process_status(kind, item)
+    title = _process_item_title(kind, status, item)
+    process_item: dict[str, Any] = {
+        "id": item_id,
+        "kind": kind,
+        "status": status,
+        "title": title,
+    }
+    detail = _process_item_detail(kind, item)
+    if detail:
+        process_item["detail"] = detail
+    phase = _first_string(item, "phase")
+    if phase:
+        process_item["phase"] = phase
+    return process_item
+
+
+def _process_kind_from_item_type(raw_type: str) -> str | None:
+    normalized = raw_type.replace("_", "").replace("-", "").lower()
+    if normalized == "commandexecution":
+        return "command"
+    if normalized == "websearch":
+        return "web_search"
+    if normalized == "imagegeneration":
+        return "image_generation"
+    if normalized in {"filechange", "patch"}:
+        return "file_change"
+    if normalized in {"mcptoolcall", "toolcall"}:
+        return "tool"
+    if normalized in {"agentmessage", "assistantmessage", "reasoning"}:
+        return "reasoning"
+    return None
+
+
+def _completed_process_status(kind: str, item: dict[str, Any]) -> str:
+    status = _first_string(item, "status")
+    if status in {"failed", "error"}:
+        return "failed"
+    if kind == "command":
+        exit_code = item.get("exitCode")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return "failed"
+    return "completed"
+
+
+def _process_item_title(kind: str, status: str, item: dict[str, Any]) -> str:
+    running = status == "running"
+    failed = status == "failed"
+    if kind == "command":
+        if running:
+            return "正在运行命令"
+        return "一次尝试未成功，已继续换方案" if failed else "已运行命令"
+    if kind == "web_search":
+        return "正在查询资料" if running else "完成资料查询"
+    if kind == "image_generation":
+        if running:
+            return "正在生成图片"
+        return "图片生成失败" if failed else "图片生成完成"
+    if kind == "file_change":
+        return "正在更新文件" if running else "文件更新完成"
+    if kind == "tool":
+        return _first_string(item, "name", "toolName", "tool_name") or ("正在调用工具" if running else "工具调用完成")
+    return "思考中.." if running else "完成一步思考"
+
+
+def _process_item_detail(kind: str, item: dict[str, Any]) -> str | None:
+    if kind == "command":
+        return _first_string(item, "command")
+    if kind == "web_search":
+        action = item.get("action")
+        action_dict = action if isinstance(action, dict) else {}
+        return (
+            _first_string(item, "query")
+            or _first_string(action_dict, "query", "url", "pattern")
+            or _first_query(item.get("queries"))
+            or _first_query(action_dict.get("queries"))
+        )
+    if kind == "image_generation":
+        saved_path = _first_string(item, "savedPath", "saved_path", "path")
+        prompt = _first_string(item, "revisedPrompt", "revised_prompt", "prompt")
+        return "\n".join(value for value in (saved_path, prompt) if value) or None
+    if kind == "file_change":
+        return _first_string(item, "path", "filePath", "file_path") or _first_file_path(item.get("files"))
+    if kind == "tool":
+        return _first_string(item, "server", "toolName", "tool_name")
+    return None
+
+
+def _first_string(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _first_query(value: Any) -> str | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            query = _first_string(item, "query")
+            if query:
+                return query
+        elif isinstance(item, str) and item.strip():
+            return item.strip()
+    return None
+
+
+def _first_file_path(value: Any) -> str | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            path = _first_string(item, "path", "relative_path", "relativePath")
+            if path:
+                return path
+        elif isinstance(item, str) and item.strip():
+            return item.strip()
+    return None
 
 
 class AgentRuntime:
@@ -312,11 +483,18 @@ class AgentRuntime:
                 context += self._render_artifact_context(conversation_id)
                 await worker.send_message(content + context)
                 artifacts = await self._persist_and_emit_artifacts(conversation_id, worker, "turn_success")
-                if artifacts and not await self._has_assistant_after_current_user(
+                final_message = worker.pop_final_assistant_message()
+                has_assistant = await self._has_assistant_after_current_user(
                     conversation_id,
                     content,
-                ):
-                    await self._persist_completion_message(conversation_id, artifacts)
+                )
+                if artifacts:
+                    if not has_assistant:
+                        await self._persist_completion_message(conversation_id, artifacts)
+                elif final_message and not has_assistant:
+                    item_id, text = final_message
+                    await self.persist_assistant_message(conversation_id, item_id, text)
+                    await self.emit(conversation_id, "assistant_message", {"item_id": item_id, "text": text})
                 await self._update_turn_state(
                     turn_id,
                     status="completed",
@@ -364,12 +542,23 @@ class AgentRuntime:
                 )
                 safe_message = _safe_user_error_message(exc)
                 if artifacts:
-                    await self._persist_recovery_message(conversation_id, artifacts)
+                    logger.warning(
+                        "Recovered turn after runtime error with artifacts",
+                        extra={
+                            "conversation_id": conversation_id,
+                            "turn_id": turn_id,
+                            "artifact_count": len(artifacts),
+                            "safe_message": safe_message,
+                        },
+                        exc_info=exc,
+                    )
+                    await self._persist_recovery_message(conversation_id, artifacts, safe_message)
                     await self.emit(
                         conversation_id,
                         "turn_recovered",
                         {
-                            "message": "已保存生成文件，但最终回复没有正常结束。",
+                            "message": "已保存生成文件，但处理在收尾阶段没有正常结束。",
+                            "error": safe_message,
                             "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts[:20]],
                         },
                     )
@@ -448,7 +637,7 @@ class AgentRuntime:
                 pass
 
     async def emit(self, conversation_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        payload = dict(payload)
+        payload = _enrich_event_payload(event_type, payload)
         active_turn_id = self._active_turn_ids.get(conversation_id)
         if active_turn_id and "rayueTurnId" not in payload:
             payload["rayueTurnId"] = active_turn_id
@@ -1066,10 +1255,13 @@ class AgentRuntime:
         self,
         conversation_id: str,
         artifacts: list[ArtifactOut],
+        error_message: str | None = None,
     ) -> None:
         item_id = f"recovered-{conversation_id}-{int(datetime.now(timezone.utc).timestamp())}"
         files = "\n".join(f"- `{artifact.relative_path}`" for artifact in artifacts[:8])
-        text = "处理没有正常结束，但已保存已生成文件。"
+        text = "已保存生成文件，但处理在收尾阶段没有正常结束。"
+        if error_message:
+            text += f"\n\n原因：{error_message}"
         if files:
             text += f"\n\n可下载文件：\n{files}"
         await self.persist_assistant_message(conversation_id, item_id, text)
@@ -1091,7 +1283,7 @@ class AgentRuntime:
     async def _has_assistant_after_current_user(
         self,
         conversation_id: str,
-        current_user_content: str,
+        _current_user_content: str,
     ) -> bool:
         async with SessionLocal() as session:
             messages = (
@@ -1103,11 +1295,11 @@ class AgentRuntime:
             ).scalars().all()
         current_user_created_at = None
         for message in reversed(messages):
-            if message.role == "user" and message.content.strip() == current_user_content.strip():
+            if message.role == "user":
                 current_user_created_at = message.created_at
                 break
         if current_user_created_at is None:
-            return any(message.role == "assistant" for message in messages)
+            return False
         return any(
             message.role == "assistant" and message.created_at > current_user_created_at
             for message in messages
@@ -1287,8 +1479,15 @@ class BaseConversationWorker:
         self.closed = True
         raise AgentTurnInterrupted()
 
+    def pop_final_assistant_message(self) -> tuple[str, str] | None:
+        return None
+
 
 class MockConversationWorker(BaseConversationWorker):
+    def __init__(self, conversation_id: str, runtime: AgentRuntime) -> None:
+        super().__init__(conversation_id, runtime)
+        self._final_assistant_message: tuple[str, str] | None = None
+
     async def send_message(self, content: str) -> None:
         self.touch()
         item_id = f"mock_{int(self.last_activity_at.timestamp())}"
@@ -1297,15 +1496,14 @@ class MockConversationWorker(BaseConversationWorker):
             "Mock agent is running because AGENT_RUN_MODE=mock. "
             f"I received: {content.strip()}"
         )
-        for token in text.split(" "):
-            await asyncio.sleep(0.03)
-            await self.runtime.emit(
-                self.conversation_id,
-                "assistant_delta",
-                {"item_id": item_id, "delta": token + " "},
-            )
-        await self.runtime.persist_assistant_message(self.conversation_id, item_id, text)
+        await asyncio.sleep(0.2)
+        self._final_assistant_message = (item_id, text)
         await self.runtime.emit(self.conversation_id, "turn_completed", {"status": "completed"})
+
+    def pop_final_assistant_message(self) -> tuple[str, str] | None:
+        message = self._final_assistant_message
+        self._final_assistant_message = None
+        return message
 
 
 class CodexAppServerWorker(BaseConversationWorker):
@@ -1322,8 +1520,10 @@ class CodexAppServerWorker(BaseConversationWorker):
         self._send_lock = asyncio.Lock()
         self._assistant_buffers: dict[str, str] = {}
         self._agent_messages_by_turn: dict[str, list[tuple[str, str]]] = {}
+        self._final_assistant_message: tuple[str, str] | None = None
         self._turn_waiters: dict[str, asyncio.Future] = {}
         self._completed_turns: set[str] = set()
+        self._completed_turn_results: dict[str, dict[str, Any]] = {}
         self._skills_fingerprint: str | None = None
         self._uploaded_files_fingerprint: str | None = None
         self._artifact_files_fingerprint: str | None = None
@@ -1363,6 +1563,44 @@ class CodexAppServerWorker(BaseConversationWorker):
         assert self.thread_id is not None
         assert self.workspace is not None
         content = content + self._render_confidentiality_contract() + self._render_output_contract()
+        await self._send_agent_turn_with_retries(content)
+
+    async def _send_agent_turn_with_retries(self, content: str) -> None:
+        attempt = 0
+        while True:
+            try:
+                await self._send_agent_turn_once(content)
+                return
+            except AgentTurnInterrupted:
+                raise
+            except AgentRuntimeError as exc:
+                if attempt >= TURN_FAILURE_RETRY_COUNT:
+                    raise
+                attempt += 1
+                self._raise_if_interrupted()
+                await self._emit_turn_retry(attempt, exc)
+                await asyncio.sleep(TURN_FAILURE_RETRY_DELAY_SECONDS)
+                self._raise_if_interrupted()
+
+    async def _emit_turn_retry(self, retry_index: int, exc: Exception) -> None:
+        self._last_command_completed_at = None
+        self._last_agent_message_completed_at = None
+        self._mark_progress("retrying")
+        await self.runtime._update_active_turn(self.conversation_id, phase="retrying")
+        await self.runtime.emit(
+            self.conversation_id,
+            "turn_retry",
+            {
+                "attempt": retry_index,
+                "maxRetries": TURN_FAILURE_RETRY_COUNT,
+                "delaySeconds": TURN_FAILURE_RETRY_DELAY_SECONDS,
+                "message": _safe_user_error_message(exc),
+            },
+        )
+
+    async def _send_agent_turn_once(self, content: str) -> None:
+        assert self.thread_id is not None
+        assert self.workspace is not None
         result = await self._request(
             "turn/start",
             {
@@ -1391,10 +1629,16 @@ class CodexAppServerWorker(BaseConversationWorker):
             finally:
                 self._active_turn_id = None
             completed_turn = turn_params.get("turn") if isinstance(turn_params, dict) else None
-            if isinstance(completed_turn, dict) and completed_turn.get("status") == "interrupted":
-                raise AgentTurnInterrupted()
+            if isinstance(completed_turn, dict):
+                completed_status = completed_turn.get("status")
+                if completed_status == "interrupted":
+                    raise AgentTurnInterrupted()
+                if completed_status == "failed":
+                    raise AgentRuntimeError(_turn_error_message(completed_turn))
 
     async def _wait_for_turn(self, turn_id: str) -> dict[str, Any]:
+        if turn_id in self._completed_turn_results:
+            return self._completed_turn_results[turn_id]
         if turn_id in self._completed_turns:
             return {"turn": {"id": turn_id, "status": "completed"}}
         loop = asyncio.get_running_loop()
@@ -1431,6 +1675,12 @@ class CodexAppServerWorker(BaseConversationWorker):
                         if await self._interrupt_and_recover_turn(turn_id, "turn_stalled"):
                             return {"turn": {"id": turn_id, "status": "completed"}}
                         raise AgentRuntimeError("生成文件后模型长时间没有返回最终回复，已保存可下载文件。")
+                    if self._should_recover_network_silence():
+                        if await self._recover_turn_after_timeout(turn_id):
+                            return {"turn": {"id": turn_id, "status": "completed"}}
+                        if await self._interrupt_and_recover_turn(turn_id, "network_stalled"):
+                            return {"turn": {"id": turn_id, "status": "completed"}}
+                        raise AgentRuntimeError("资料查询长时间没有返回，已尝试停止并保存结果。")
                     if self._should_recover_model_silence():
                         if await self._recover_turn_after_timeout(turn_id):
                             return {"turn": {"id": turn_id, "status": "completed"}}
@@ -1455,10 +1705,12 @@ class CodexAppServerWorker(BaseConversationWorker):
         message_by_phase = {
             "command": "命令仍在运行，等待工具返回",
             "model": "正在等待模型返回",
+            "network": "正在查询资料",
             "waiting_for_model": "工具已返回，正在等待模型确认结果",
             "recovering": "任务没有继续返回，正在保存已生成文件",
             "reasoning": "正在整理下一步",
             "agent_message": "正在生成回复",
+            "retrying": "出错后正在等待重试",
         }
         await self.runtime.emit(
             self.conversation_id,
@@ -1495,6 +1747,14 @@ class CodexAppServerWorker(BaseConversationWorker):
             datetime.now(timezone.utc) - last_progress
         ).total_seconds()
         return silence_seconds >= POST_COMMAND_SILENCE_RECOVERY_SECONDS
+
+    def _should_recover_network_silence(self) -> bool:
+        if self._last_progress_phase != "network":
+            return False
+        silence_seconds = (
+            datetime.now(timezone.utc) - self._last_progress_at
+        ).total_seconds()
+        return silence_seconds >= NETWORK_TOOL_SILENCE_RECOVERY_SECONDS
 
     def _should_recover_model_silence(self) -> bool:
         if self._last_command_completed_at is not None or self._last_progress_phase == "command":
@@ -1681,6 +1941,13 @@ Output storage contract:
 - Copy only final user-facing deliverables into `{FINAL_OUTPUT_DIR}/`.
 - Rayue only saves and shows files under `{FINAL_OUTPUT_DIR}/`; anything outside it is treated as intermediate state.
 - If you modify a PPT, DOCX, XLSX, PDF, image, video, archive, or HTML file, ensure the final downloadable version is in `{FINAL_OUTPUT_DIR}/`.
+
+Image generation contract:
+- If the user's request asks to create, generate, draw, render, design, edit, enhance, transform, restyle, or recreate an image, use the `gpt-image-2` skill first for the image output.
+- If the user asks why a prior image task did not use `gpt-image-2`, treat that as image-generation intent when an image result is still expected; create the image instead of only explaining.
+- Default to `quality=low` and `moderation=low` unless the user explicitly asks for higher quality or different moderation.
+- Generated images can take 60-180 seconds. Let the tool finish and save the final image under `{FINAL_OUTPUT_DIR}/`.
+- Use code/vector rendering only after a `gpt-image-2` attempt fails or when the user explicitly asks for code, SVG, chart-precise layout, or no image generation.
 """
 
     def _render_confidentiality_contract(self) -> str:
@@ -2368,7 +2635,6 @@ Rayue confidentiality contract:
             delta = params.get("delta") or ""
             if item_id:
                 self._assistant_buffers[item_id] = self._assistant_buffers.get(item_id, "") + delta
-            await self.runtime.emit(self.conversation_id, "assistant_delta", params)
             return
 
         if method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta"}:
@@ -2406,6 +2672,11 @@ Rayue confidentiality contract:
                     phase="waiting_for_model",
                     command_completed=True,
                 )
+            if item.get("type") in NETWORK_TOOL_ITEM_TYPES:
+                self._last_command_completed_at = None
+                self._last_agent_message_completed_at = None
+                self._mark_progress("model")
+                await self.runtime._update_active_turn(self.conversation_id, phase="model")
             if _completed_item_may_have_artifact(item):
                 self._schedule_artifact_snapshot()
             return
@@ -2445,30 +2716,41 @@ Rayue confidentiality contract:
                         self._last_agent_message_completed_at = None
                         self._mark_progress("reasoning")
                         await self.runtime._update_active_turn(self.conversation_id, phase="reasoning")
-            await self.runtime.emit(self.conversation_id, event_type, params)
+                    elif item.get("type") in NETWORK_TOOL_ITEM_TYPES:
+                        self._last_command_completed_at = None
+                        self._last_agent_message_completed_at = None
+                        self._mark_progress("network")
+                        await self.runtime._update_active_turn(self.conversation_id, phase="network")
             if method == "turn/completed":
                 self._last_command_completed_at = None
                 self._last_agent_message_completed_at = None
-                self._mark_progress("completed")
-                await self.runtime._update_active_turn(
-                    self.conversation_id,
-                    status="completed",
-                    phase="completed",
-                    completed=True,
-                )
                 turn = params.get("turn") or {}
-                turn_id = turn.get("id")
-                if turn_id:
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+                terminal_status = _rayue_turn_terminal_status(turn) if isinstance(turn, dict) else "completed"
+                self._mark_progress(terminal_status)
+                if terminal_status == "failed":
+                    await self.runtime._update_active_turn(self.conversation_id, phase="failed")
+                else:
+                    await self.runtime._update_active_turn(
+                        self.conversation_id,
+                        status=terminal_status,
+                        phase=terminal_status,
+                        completed=True,
+                    )
+                    await self.runtime.emit(self.conversation_id, event_type, params)
+                if turn_id and terminal_status == "completed":
                     self._remember_agent_messages_from_turn(turn_id, turn)
                     if not self._agent_messages_by_turn.get(turn_id):
                         await self._backfill_turn_messages(turn_id)
                     await self._emit_final_assistant_message(turn_id)
-                await self._emit_artifact_summary("turn_completed")
                 if turn_id:
                     self._completed_turns.add(turn_id)
+                    self._completed_turn_results[turn_id] = params
                     future = self._turn_waiters.get(turn_id)
                     if future and not future.done():
                         future.set_result(params)
+            else:
+                await self.runtime.emit(self.conversation_id, event_type, params)
         elif self.runtime.settings.log_codex_raw_events:
             await self.runtime.emit(self.conversation_id, "raw_codex_event", message)
 
@@ -2485,12 +2767,12 @@ Rayue confidentiality contract:
         if not messages:
             return
         item_id, text = messages[-1]
-        await self.runtime.persist_assistant_message(self.conversation_id, item_id, text)
-        await self.runtime.emit(
-            self.conversation_id,
-            "assistant_message",
-            {"item_id": item_id, "text": text},
-        )
+        self._final_assistant_message = (item_id, text)
+
+    def pop_final_assistant_message(self) -> tuple[str, str] | None:
+        message = self._final_assistant_message
+        self._final_assistant_message = None
+        return message
 
     def _remember_agent_message(self, turn_id: str, item_id: str, text: str) -> None:
         messages = self._agent_messages_by_turn.setdefault(turn_id, [])
@@ -2570,16 +2852,13 @@ Rayue confidentiality contract:
                 if not isinstance(text, str) or not text.strip():
                     continue
                 item_id = item.get("id") if isinstance(item.get("id"), str) else f"{turn_id}-message-{index}"
-                await self.runtime.persist_assistant_message(self.conversation_id, item_id, text)
-                await self.runtime.emit(
-                    self.conversation_id,
-                    "assistant_message",
-                    {"item_id": item_id, "text": text},
-                )
+                self._remember_agent_message(turn_id, item_id, text)
                 recovered_message = True
             break
 
         artifacts = await self._emit_artifact_summary("turn_recovered")
+        if recovered_message:
+            await self._emit_final_assistant_message(turn_id)
         if recovered_message or recovered_completed or (complete_on_artifacts and artifacts):
             self._completed_turns.add(turn_id)
             await self.runtime._update_active_turn(
@@ -2821,6 +3100,33 @@ def _safe_user_error_message(exc: Exception) -> str:
     return message
 
 
+def _rayue_turn_terminal_status(turn: dict[str, Any]) -> str:
+    status = turn.get("status")
+    if status in {"completed", "failed", "interrupted"}:
+        return status
+    if turn.get("error"):
+        return "failed"
+    return "completed"
+
+
+def _turn_error_message(turn: dict[str, Any]) -> str:
+    error = turn.get("error")
+    message = ""
+    if isinstance(error, dict):
+        raw_message = error.get("message")
+        if isinstance(raw_message, str):
+            message = raw_message.strip()
+    elif isinstance(error, str):
+        message = error.strip()
+
+    lower = message.lower()
+    if "429" in lower or "too many requests" in lower:
+        return "请求过于频繁（429 Too Many Requests），请稍后重试。"
+    if message:
+        return message
+    return "任务运行失败，请稍后重试。"
+
+
 def _sandbox_envs(settings: Settings, gpt_image2_api_key: str) -> dict[str, str]:
     envs = {
         "CODEX_API_KEY": settings.codex_api_key or "",
@@ -2837,7 +3143,10 @@ def _sandbox_envs(settings: Settings, gpt_image2_api_key: str) -> dict[str, str]
 
 
 def _completed_item_may_have_artifact(item: dict[str, Any]) -> bool:
-    if item.get("type") != "commandExecution" or item.get("exitCode") != 0:
+    item_type = item.get("type")
+    if item_type in {"imageGeneration", "fileChange"}:
+        return True
+    if item_type != "commandExecution" or item.get("exitCode") != 0:
         return False
     text = " ".join(
         value

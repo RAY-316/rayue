@@ -102,6 +102,10 @@ Choose colors that match your topic — don't default to generic blue. Use these
 
 **Never distort images.** When an image has to fit a different frame, preserve its aspect ratio:
 
+- For PptxGenJS, do **not** add photos/product images with bare `slide.addImage({ path, x, y, w, h })`; that stretches the image if the frame ratio differs.
+- Use `scripts/pptx_image_fit.js` for every photo, product image, screenshot, chart image, portrait, logo, or externally sourced visual:
+  - `addImageContain(...)` when the complete image must remain visible.
+  - `addImageCover(...)` when the frame must be filled; it pre-crops with `sharp` to the frame ratio before insertion.
 - Use proportional resizing when the full image must remain visible.
 - Use proportional scaling plus cropping when the frame must be filled.
 - Do not set arbitrary width and height values that squeeze or stretch the image.
@@ -177,6 +181,12 @@ If grep returns results, fix them before declaring success.
 ### Visual QA
 
 **⚠️ USE SUBAGENTS** — even for 2-3 slides. You've been staring at the code and will see what you expect, not what's there. Subagents have fresh eyes.
+
+Before visual inspection, run the aspect-ratio checker. If it reports possible stretched images, fix them before continuing:
+
+```bash
+python scripts/check_image_aspect.py output.pptx
+```
 
 Convert slides to images (see [Converting to Images](#converting-to-images)), then use this prompt:
 

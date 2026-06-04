@@ -18,6 +18,7 @@ import {
   FileUp,
   Lightbulb,
   Loader2,
+  MoreHorizontal,
   Trash2,
   MessageSquarePlus,
   Paperclip,
@@ -66,6 +67,7 @@ import {
   stopConversation,
   startPasswordReset,
   startRegister,
+  updateConversationTitle,
   updateWorkspace,
   uploadFiles,
   workspaceFileDownloadUrl,
@@ -90,6 +92,7 @@ const PROCESS_DETAIL_LIMIT = 360;
 const MAX_EVENT_HISTORY = 3000;
 const INLINE_ARTIFACT_LIMIT = 12;
 const WORKSPACE_FILE_CACHE_TTL_MS = 30_000;
+const DEFAULT_CONVERSATION_TITLE = "新对话";
 
 type LoadActiveOptions = {
   includeFiles?: boolean;
@@ -108,21 +111,29 @@ function messageFromApi(message: Message): LocalMessage {
   };
 }
 
+function conversationDisplayTitle(conversation: Conversation | null | undefined) {
+  if (!conversation) {
+    return "暂无会话";
+  }
+  const title = conversation.title.trim();
+  return title && title !== "New conversation" ? title : DEFAULT_CONVERSATION_TITLE;
+}
+
 function mergeMessages(current: LocalMessage[], incoming: LocalMessage[]) {
   const incomingById = new Map(incoming.map((message) => [message.id, message]));
   const merged = new Map(incomingById);
   for (const message of current) {
-    if (!message.id.startsWith("local-user-")) {
+    if (message.id.startsWith("local-user-")) {
+      const alreadyPersisted = incoming.some(
+        (incomingMessage) =>
+          incomingMessage.role === message.role &&
+          incomingMessage.content === message.content &&
+          Math.abs(timestamp(incomingMessage.createdAt ?? "") - timestamp(message.createdAt ?? "")) < 120_000,
+      );
+      if (!alreadyPersisted) {
+        merged.set(message.id, message);
+      }
       continue;
-    }
-    const alreadyPersisted = incoming.some(
-      (incomingMessage) =>
-        incomingMessage.role === message.role &&
-        incomingMessage.content === message.content &&
-        Math.abs(timestamp(incomingMessage.createdAt ?? "") - timestamp(message.createdAt ?? "")) < 120_000,
-    );
-    if (!alreadyPersisted) {
-      merged.set(message.id, message);
     }
   }
   return Array.from(merged.values()).sort(
@@ -139,19 +150,35 @@ function normalizeItemId(payload: Record<string, unknown>): string | undefined {
   return getPayloadString(payload, "itemId") ?? getPayloadString(payload, "item_id");
 }
 
+type ProcessKind =
+  | "reasoning"
+  | "command"
+  | "network"
+  | "image"
+  | "file"
+  | "tool"
+  | "setup"
+  | "result"
+  | "warning"
+  | "error";
+type ProcessStepStatus = "running" | "done" | "warning" | "error";
+
 type ProcessStep = {
   id: string;
-  kind: "reasoning" | "command" | "file" | "setup" | "result" | "warning" | "error";
+  kind: ProcessKind;
   title: string;
   detail?: string;
-  status?: "running" | "done" | "warning" | "error";
+  status?: ProcessStepStatus;
+  startedAt?: string;
+  completedAt?: string;
+  order?: number;
 };
 
 type ActiveProcess = {
-  kind: "reasoning" | "command" | "network" | "file" | "setup" | "warning" | "error";
+  kind: Exclude<ProcessKind, "result">;
   title: string;
   detail?: string;
-  status?: "running" | "done" | "warning" | "error";
+  status?: ProcessStepStatus;
 };
 
 type ProcessGroup = {
@@ -161,7 +188,9 @@ type ProcessGroup = {
   status: "running" | "done" | "error";
   reasoning: string;
   active?: ActiveProcess;
+  activeItemId?: string;
   steps: ProcessStep[];
+  stepSequence: number;
   commandCount: number;
   failedCommandCount: number;
 };
@@ -448,7 +477,9 @@ function buildProcessGroups(events: AgentEvent[]): ProcessGroup[] {
       status: "running",
       reasoning: "",
       active: undefined,
+      activeItemId: undefined,
       steps: [],
+      stepSequence: 0,
       commandCount: 0,
       failedCommandCount: 0,
     };
@@ -475,7 +506,7 @@ function buildProcessGroups(events: AgentEvent[]): ProcessGroup[] {
   }
 
   for (const event of events) {
-    if (event.type === "stream_connected" || event.type === "assistant_delta") {
+    if (event.type === "stream_connected") {
       continue;
     }
     if (event.type === "turn_started") {
@@ -508,10 +539,7 @@ function buildProcessGroups(events: AgentEvent[]): ProcessGroup[] {
       group = current;
     }
     if (!group && event.type === "conversation_status") {
-      const status = getPayloadString(event.payload, "status");
-      if (status !== "queued" && status !== "running" && status !== "stopping") {
-        continue;
-      }
+      continue;
     }
     if (!group && isProcessEvent(event)) {
       group = createGroup(turnId ?? `process-${event.created_at ?? groups.length}`, event);
@@ -552,6 +580,7 @@ function isProcessEvent(event: AgentEvent) {
     "turn_completed",
     "turn_watchdog",
     "turn_interrupted",
+    "turn_retry",
     "turn_recovered",
   ].includes(event.type);
 }
@@ -573,6 +602,7 @@ const SETTLED_PROCESS_EVENTS_TO_IGNORE = new Set([
   "thread_started",
   "turn_interrupted",
   "turn_recovered",
+  "turn_retry",
   "turn_started",
   "turn_watchdog",
 ]);
@@ -596,59 +626,79 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
 
   if (event.type === "item_started" || event.type === "item_completed") {
     const item = getPayloadObject(event.payload, "item");
-    if (item?.type === "agentMessage") {
-      if (event.type === "item_completed") {
-        const text = typeof item.text === "string" ? item.text.trim() : "";
-        const itemId = typeof item.id === "string" ? item.id : `${group.id}-agent-${group.steps.length}`;
-        if (text) {
-          upsertStep(group, {
-            id: `agent-${itemId}`,
-            kind: "reasoning",
-            title: text,
-            status: "done",
-          });
-        }
+    const kind = processItemKind(event, item);
+    const phase = processPhase(event, item);
+
+    if (kind === "reasoning") {
+      const itemId = processItemId(event, item, "reasoning", `${group.steps.length}`);
+      if (event.type === "item_started") {
+        group.activeItemId = `reasoning-${itemId}`;
+        group.active = {
+          kind: "reasoning",
+          title: phase === "final_answer" ? "正在整理回复" : "思考中..",
+          status: "running",
+        };
+      } else {
+        clearActiveItem(group, `reasoning-${itemId}`);
+        setThinkingActive(group);
       }
       return;
     }
-    if (item?.type === "commandExecution") {
-      const command = typeof item.command === "string" ? item.command : "";
-      const exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
-      const itemId = typeof item.id === "string" ? item.id : `command-${group.commandCount}`;
+
+    if (kind === "command") {
+      const itemPayload = item ?? {};
+      const command = typeof itemPayload.command === "string" ? itemPayload.command : "";
+      const exitCode = typeof itemPayload.exitCode === "number" ? itemPayload.exitCode : null;
+      const itemId = processItemId(event, item, "command", `${group.commandCount}`);
       if (event.type === "item_started") {
-        group.active = {
-          kind: "command",
-          title: "正在运行命令",
-          detail: compactCommand(command),
-          status: "running",
-        };
+        upsertStep(
+          group,
+          {
+            id: `command-${itemId}`,
+            kind: "command",
+            title: processMetaTitle(event, "正在运行命令"),
+            detail: compactCommand(command),
+            status: "running",
+            startedAt: event.created_at,
+          },
+          { active: true },
+        );
         return;
       }
 
       group.commandCount += 1;
-      if (exitCode === 0) {
-        upsertStep(group, {
-          id: `command-${itemId}`,
-          kind: "command",
-          title: commandSummaryTitle(item),
-          detail: compactCommand(command),
-          status: "done",
-        });
-        group.active = {
-          kind: "reasoning",
-          title: "思考中..",
-          status: "running",
-        };
+      const completedStatus = processMetaStatus(event);
+      const failed = completedStatus === "error" || (exitCode !== null && exitCode !== 0);
+      if (!failed) {
+        upsertStep(
+          group,
+          {
+            id: `command-${itemId}`,
+            kind: "command",
+            title: processMetaTitle(event, commandSummaryTitle(itemPayload)),
+            detail: compactCommand(command),
+            status: "done",
+            completedAt: event.created_at,
+          },
+          { clearActive: true },
+        );
+        setThinkingActive(group);
       } else {
         group.failedCommandCount += 1;
-        const failure = commandFailureDetail(item);
-        upsertStep(group, {
-          id: `command-${itemId}`,
-          kind: "command",
-          title: "一次尝试未成功，已继续换方案",
-          detail: combineDetails(compactCommand(command), failure),
-          status: "warning",
-        });
+        const failure = commandFailureDetail(itemPayload);
+        upsertStep(
+          group,
+          {
+            id: `command-${itemId}`,
+            kind: "command",
+            title: processMetaTitle(event, "一次尝试未成功，已继续换方案"),
+            detail: combineDetails(compactCommand(command), failure),
+            status: "warning",
+            completedAt: event.created_at,
+          },
+          { clearActive: true },
+        );
+        group.activeItemId = undefined;
         group.active = {
           kind: "warning",
           title: "上个办法没跑通，正在尝试其他方式",
@@ -656,6 +706,149 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
           status: "running",
         };
       }
+      return;
+    }
+
+    if (kind === "network") {
+      const detail = processMetaString(event, "detail") ?? extractNetworkDetail(item);
+      const itemId = processItemId(event, item, "network", `${group.steps.length}`);
+      if (event.type === "item_started") {
+        upsertStep(
+          group,
+          {
+            id: `network-${itemId}`,
+            kind: "network",
+            title: processMetaTitle(event, "正在查询资料"),
+            detail,
+            status: "running",
+            startedAt: event.created_at,
+          },
+          { active: true },
+        );
+        return;
+      }
+      upsertStep(
+        group,
+        {
+          id: `network-${itemId}`,
+          kind: "network",
+          title: processMetaTitle(event, processMetaStatus(event) === "error" ? "资料查询失败" : "完成资料查询"),
+          detail,
+          status: processMetaStatus(event) ?? "done",
+          completedAt: event.created_at,
+        },
+        { clearActive: true },
+      );
+      setThinkingActive(group);
+      return;
+    }
+
+    if (kind === "image") {
+      const itemId = processItemId(event, item, "image", `${group.steps.length}`);
+      const detail = processMetaString(event, "detail") ?? extractImageGenerationDetail(item);
+      if (event.type === "item_started") {
+        upsertStep(
+          group,
+          {
+            id: `image-${itemId}`,
+            kind: "image",
+            title: processMetaTitle(event, "正在生成图片"),
+            detail,
+            status: "running",
+            startedAt: event.created_at,
+          },
+          { active: true },
+        );
+        return;
+      }
+      upsertStep(
+        group,
+        {
+          id: `image-${itemId}`,
+          kind: "image",
+          title: processMetaTitle(event, processMetaStatus(event) === "error" ? "图片生成失败" : "图片生成完成"),
+          detail,
+          status: processMetaStatus(event) ?? "done",
+          completedAt: event.created_at,
+        },
+        { clearActive: true },
+      );
+      setThinkingActive(group);
+      return;
+    }
+
+    if (kind === "file") {
+      const itemId = processItemId(event, item, "file", `${group.steps.length}`);
+      const detail = processMetaString(event, "detail") ?? extractFileChangeDetail(item);
+      if (event.type === "item_started") {
+        upsertStep(
+          group,
+          {
+            id: `file-${itemId}`,
+            kind: "file",
+            title: processMetaTitle(event, "正在更新文件"),
+            detail,
+            status: "running",
+            startedAt: event.created_at,
+          },
+          { active: true },
+        );
+        return;
+      }
+      upsertStep(
+        group,
+        {
+          id: `file-${itemId}`,
+          kind: "file",
+          title: processMetaTitle(event, processMetaStatus(event) === "error" ? "文件更新失败" : "文件更新完成"),
+          detail,
+          status: processMetaStatus(event) ?? "done",
+          completedAt: event.created_at,
+        },
+        { clearActive: true },
+      );
+      setThinkingActive(group);
+      return;
+    }
+
+    if (kind === "tool") {
+      const itemId = processItemId(event, item, "tool", `${group.steps.length}`);
+      const itemPayload = item ?? {};
+      const metaTitle = processMetaString(event, "title");
+      const name =
+        metaTitle ||
+        getPayloadString(itemPayload, "name") ||
+        getPayloadString(itemPayload, "toolName") ||
+        "调用工具";
+      const detail = processMetaString(event, "detail");
+      if (event.type === "item_started") {
+        upsertStep(
+          group,
+          {
+            id: `tool-${itemId}`,
+            kind: "tool",
+            title: name,
+            detail,
+            status: "running",
+            startedAt: event.created_at,
+          },
+          { active: true },
+        );
+        return;
+      }
+      upsertStep(
+        group,
+        {
+          id: `tool-${itemId}`,
+          kind: "tool",
+          title: name,
+          detail,
+          status: processMetaStatus(event) ?? "done",
+          completedAt: event.created_at,
+        },
+        { clearActive: true },
+      );
+      setThinkingActive(group);
     }
     return;
   }
@@ -663,12 +856,14 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
   if (event.type === "assistant_message") {
     const itemId = normalizeItemId(event.payload);
     if (itemId) {
-      group.steps = group.steps.filter((step) => step.id !== `agent-${itemId}`);
+      group.steps = group.steps.filter((step) => step.id !== `agent-${itemId}` && step.id !== `reasoning-${itemId}`);
+      clearActiveItem(group, `reasoning-${itemId}`);
     }
     return;
   }
 
   if (event.type === "turn_started") {
+    group.activeItemId = undefined;
     group.active = { kind: "setup", title: "思考中..", status: "running" };
     return;
   }
@@ -707,7 +902,7 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
 
   if (event.type === "conversation_status") {
     const status = getPayloadString(event.payload, "status");
-    if ((status === "queued" || status === "running") && group.status === "running") {
+    if ((status === "queued" || status === "running") && group.status === "running" && !group.activeItemId) {
       group.active = {
         kind: "setup",
         title: "思考中..",
@@ -715,6 +910,7 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
       };
     }
     if (status === "stopping" && group.status === "running") {
+      group.activeItemId = undefined;
       group.active = {
         kind: "setup",
         title: "正在停止",
@@ -826,7 +1022,9 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
       status: "done",
     });
     group.active =
-      group.status === "running"
+      group.status === "running" && group.activeItemId
+        ? group.active
+        : group.status === "running"
         ? { kind: "reasoning", title: "思考中..", status: "running" }
         : {
             kind: "file",
@@ -841,8 +1039,10 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
     const phase = getPayloadString(event.payload, "phase");
     const message = getPayloadString(event.payload, "message") ?? "正在等待任务继续返回";
     const silenceSeconds = getPayloadNumber(event.payload, "silenceSeconds");
+    const kind = phase === "command" ? "command" : phase === "network" ? "network" : "reasoning";
+    group.activeItemId = undefined;
     group.active = {
-      kind: phase === "command" ? "command" : "reasoning",
+      kind,
       title: message,
       detail:
         silenceSeconds && silenceSeconds >= 60
@@ -870,7 +1070,9 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
       title: "规划处理步骤",
       status: "done",
     });
-    group.active = { kind: "reasoning", title: "思考中..", status: "running" };
+    if (!group.activeItemId) {
+      group.active = { kind: "reasoning", title: "思考中..", status: "running" };
+    }
     return;
   }
 
@@ -883,9 +1085,41 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
       id: `${group.id}-recovered`,
       kind: "file",
       title: "已保存生成文件",
-      detail: getPayloadString(event.payload, "message"),
+      detail: combineDetails(
+        getPayloadString(event.payload, "message"),
+        getPayloadString(event.payload, "error"),
+      ),
       status: "done",
     });
+    return;
+  }
+
+  if (event.type === "turn_retry") {
+    const attempt = getPayloadNumber(event.payload, "attempt");
+    const maxRetries = getPayloadNumber(event.payload, "maxRetries");
+    const delaySeconds = getPayloadNumber(event.payload, "delaySeconds");
+    const message = getPayloadString(event.payload, "message");
+    const retryLabel =
+      attempt && maxRetries
+        ? `第 ${attempt}/${maxRetries} 次重试`
+        : "准备重试";
+    const delayLabel = delaySeconds ? `等待 ${delaySeconds} 秒后重试` : "稍后重试";
+    group.status = "running";
+    group.completedAt = undefined;
+    group.activeItemId = undefined;
+    upsertStep(group, {
+      id: `${group.id}-retry-${attempt ?? group.steps.length}`,
+      kind: "warning",
+      title: retryLabel,
+      detail: message ? `${delayLabel}\n${message}` : delayLabel,
+      status: "warning",
+    });
+    group.active = {
+      kind: "warning",
+      title: delayLabel,
+      detail: message,
+      status: "running",
+    };
     return;
   }
 
@@ -893,6 +1127,7 @@ function addEventToProcessGroup(group: ProcessGroup, event: AgentEvent) {
     group.status = "error";
     group.completedAt = event.created_at ?? group.createdAt;
     finishRunningSteps(group, "error");
+    group.activeItemId = undefined;
     group.active = {
       kind: "error",
       title: "处理遇到问题",
@@ -932,19 +1167,194 @@ function shouldAttachBeforeTurn(event: AgentEvent) {
   ].includes(event.type);
 }
 
-function upsertStep(group: ProcessGroup, step: ProcessStep) {
+function upsertStep(group: ProcessGroup, step: ProcessStep, options?: { active?: boolean; clearActive?: boolean }) {
   const index = group.steps.findIndex((item) => item.id === step.id);
+  const nextStep = {
+    ...step,
+    order: index >= 0 ? group.steps[index].order : group.stepSequence++,
+  };
   if (index >= 0) {
-    group.steps[index] = { ...group.steps[index], ...step };
+    group.steps[index] = { ...group.steps[index], ...nextStep };
+    if (options?.active) {
+      setActiveFromStep(group, group.steps[index]);
+    }
+    if (options?.clearActive) {
+      clearActiveItem(group, step.id);
+    }
     return;
   }
-  group.steps.push(step);
+  group.steps.push(nextStep);
+  if (options?.active) {
+    setActiveFromStep(group, nextStep);
+  }
+  if (options?.clearActive) {
+    clearActiveItem(group, step.id);
+  }
 }
 
 function finishRunningSteps(group: ProcessGroup, status: "done" | "error") {
   group.steps = group.steps.map((step) =>
-    step.status === "running" ? { ...step, status } : step,
+    step.status === "running" ? { ...step, status, completedAt: step.completedAt ?? group.completedAt } : step,
   );
+  group.activeItemId = undefined;
+}
+
+function setActiveFromStep(group: ProcessGroup, step: ProcessStep) {
+  if (step.kind === "result") {
+    return;
+  }
+  group.activeItemId = step.id;
+  group.active = {
+    kind: step.kind,
+    title: step.title,
+    detail: step.detail,
+    status: step.status,
+  };
+}
+
+function clearActiveItem(group: ProcessGroup, itemId: string) {
+  if (group.activeItemId === itemId) {
+    group.activeItemId = undefined;
+    group.active = undefined;
+  }
+}
+
+function setThinkingActive(group: ProcessGroup) {
+  if (group.status !== "running" || group.activeItemId) {
+    return;
+  }
+  group.active = { kind: "reasoning", title: "思考中..", status: "running" };
+}
+
+function processMeta(event: AgentEvent) {
+  return getPayloadObject(event.payload, "processItem");
+}
+
+function processMetaString(event: AgentEvent, key: string) {
+  const meta = processMeta(event);
+  const fromMeta = meta ? getPayloadString(meta, key) : undefined;
+  return fromMeta ?? getPayloadString(event.payload, key);
+}
+
+function processMetaStatus(event: AgentEvent): ProcessStepStatus | undefined {
+  const status = processMetaString(event, "status");
+  if (status === "running") {
+    return "running";
+  }
+  if (status === "completed" || status === "done") {
+    return "done";
+  }
+  if (status === "failed" || status === "error") {
+    return "error";
+  }
+  if (status === "warning") {
+    return "warning";
+  }
+  return undefined;
+}
+
+function processMetaTitle(event: AgentEvent, fallback: string) {
+  return processMetaString(event, "title") ?? fallback;
+}
+
+function processItemId(
+  event: AgentEvent,
+  item: Record<string, unknown> | undefined,
+  prefix: string,
+  fallback: string,
+) {
+  return (
+    processMetaString(event, "id") ??
+    processMetaString(event, "itemId") ??
+    normalizeItemId(event.payload) ??
+    (typeof item?.id === "string" ? item.id : undefined) ??
+    `${prefix}-${fallback}`
+  );
+}
+
+function processItemKind(event: AgentEvent, item: Record<string, unknown> | undefined): ProcessKind | undefined {
+  const value = processMetaString(event, "kind") ?? (typeof item?.type === "string" ? item.type : undefined);
+  const normalized = value?.replace(/[_-]/g, "").toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "command" || normalized === "commandexecution") {
+    return "command";
+  }
+  if (normalized === "websearch" || normalized === "network") {
+    return "network";
+  }
+  if (normalized === "image" || normalized === "imagegeneration") {
+    return "image";
+  }
+  if (normalized === "file" || normalized === "filechange" || normalized === "patch") {
+    return "file";
+  }
+  if (normalized === "mcptoolcall" || normalized === "tool" || normalized === "toolcall") {
+    return "tool";
+  }
+  if (normalized === "reasoning" || normalized === "agentmessage" || normalized === "assistantmessage") {
+    return "reasoning";
+  }
+  return undefined;
+}
+
+function processPhase(event: AgentEvent, item: Record<string, unknown> | undefined) {
+  return (
+    processMetaString(event, "phase") ??
+    getPayloadString(event.payload, "phase") ??
+    (typeof item?.phase === "string" ? item.phase : undefined)
+  );
+}
+
+function extractNetworkDetail(item: Record<string, unknown> | undefined) {
+  if (!item) {
+    return undefined;
+  }
+  const query = typeof item.query === "string" ? item.query.trim() : "";
+  if (query) {
+    return query;
+  }
+  const action = getPayloadObject(item, "action");
+  const queries = getPayloadArray(item, "queries")
+    .map((entry) => (typeof entry.query === "string" ? entry.query.trim() : ""))
+    .filter(Boolean);
+  const actionQueries = action
+    ? getPayloadArray(action, "queries")
+        .map((entry) => (typeof entry.query === "string" ? entry.query.trim() : ""))
+        .filter(Boolean)
+    : [];
+  const url = action ? getPayloadString(action, "url") : undefined;
+  const pattern = action ? getPayloadString(action, "pattern") : undefined;
+  return queries[0] ?? actionQueries[0] ?? url ?? pattern;
+}
+
+function extractImageGenerationDetail(item: Record<string, unknown> | undefined) {
+  if (!item) {
+    return undefined;
+  }
+  const savedPath =
+    getPayloadString(item, "savedPath") ??
+    getPayloadString(item, "saved_path") ??
+    getPayloadString(item, "path");
+  const prompt =
+    getPayloadString(item, "revisedPrompt") ??
+    getPayloadString(item, "revised_prompt") ??
+    getPayloadString(item, "prompt");
+  return combineDetails(savedPath ? `保存到：${savedPath}` : undefined, prompt);
+}
+
+function extractFileChangeDetail(item: Record<string, unknown> | undefined) {
+  if (!item) {
+    return undefined;
+  }
+  const path = getPayloadString(item, "path") ?? getPayloadString(item, "filePath") ?? getPayloadString(item, "file_path");
+  const files = getPayloadArray(item, "files")
+    .map((entry) => getPayloadString(entry, "path") ?? getPayloadString(entry, "relative_path"))
+    .filter(Boolean)
+    .slice(0, 4)
+    .join(", ");
+  return path ?? files;
 }
 
 function commandSummaryTitle(item: Record<string, unknown>) {
@@ -1074,6 +1484,25 @@ function mergeEvents(current: AgentEvent[], incoming: AgentEvent[]) {
   return Array.from(byKey.values())
     .sort((left, right) => timestamp(left.created_at ?? "") - timestamp(right.created_at ?? ""))
     .slice(-MAX_EVENT_HISTORY);
+}
+
+function localProcessEvent(
+  conversationId: string,
+  type: string,
+  turnId: string,
+  createdAt: string,
+  payload: Record<string, unknown> = {},
+): AgentEvent {
+  return {
+    id: `local-${type}-${turnId}-${createdAt}`,
+    conversation_id: conversationId,
+    type,
+    payload: {
+      ...payload,
+      rayueTurnId: turnId,
+    },
+    created_at: createdAt,
+  };
 }
 
 function isPreviewableImage(artifact: Artifact) {
@@ -1255,6 +1684,7 @@ export default function Home() {
   const stickToBottomRef = useRef(false);
   const forceScrollBottomRef = useRef(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [conversationMenuId, setConversationMenuId] = useState<string | null>(null);
 
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeId) ?? null,
@@ -1308,6 +1738,7 @@ export default function Home() {
 
   const switchConversation = useCallback((conversationId: string | null) => {
     const workspaceId = activeWorkspaceIdRef.current;
+    setConversationMenuId(null);
     activeIdRef.current = conversationId;
     activeStatusRef.current =
       conversationsRef.current.find((conversation) => conversation.id === conversationId)?.status ?? "idle";
@@ -1323,6 +1754,26 @@ export default function Home() {
     stickToBottomRef.current = false;
     forceScrollBottomRef.current = false;
   }, []);
+
+  useEffect(() => {
+    if (!conversationMenuId) {
+      return;
+    }
+    function closeMenu() {
+      setConversationMenuId(null);
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    }
+    window.addEventListener("mousedown", closeMenu);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", closeMenu);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [conversationMenuId]);
 
   const refreshConversations = useCallback(async (workspaceId = activeWorkspaceIdRef.current) => {
     const rows = await listConversations(workspaceId);
@@ -1568,9 +2019,6 @@ export default function Home() {
           );
         }
       }
-      if (event.type === "assistant_delta") {
-        return;
-      }
       if (event.type === "assistant_message") {
         const itemId = normalizeItemId(event.payload) ?? getPayloadString(event.payload, "item_id");
         const text = getPayloadString(event.payload, "text") ?? "";
@@ -1579,7 +2027,7 @@ export default function Home() {
             const existing = prev.find((msg) => msg.role === "assistant" && msg.itemId === itemId);
             if (existing) {
               return prev.map((msg) =>
-                msg.id === existing.id ? { ...msg, content: text, pending: false } : msg,
+                msg.id === existing.id ? { ...msg, content: text } : msg,
               );
             }
             return [
@@ -1590,7 +2038,6 @@ export default function Home() {
                 content: text,
                 itemId,
                 createdAt: event.created_at ?? new Date().toISOString(),
-                pending: false,
               },
             ];
           });
@@ -1641,10 +2088,18 @@ export default function Home() {
     const shouldAnimate = forceScrollBottomRef.current;
     forceScrollBottomRef.current = false;
     window.requestAnimationFrame(() => {
-      bottomRef.current?.scrollIntoView({
-        behavior: shouldAnimate ? "smooth" : "auto",
-        block: "end",
-      });
+      const container = scrollContainerRef.current;
+      if (container) {
+        container.scrollTo({
+          top: container.scrollHeight,
+          behavior: shouldAnimate ? "smooth" : "auto",
+        });
+      } else {
+        bottomRef.current?.scrollIntoView({
+          behavior: shouldAnimate ? "smooth" : "auto",
+          block: "end",
+        });
+      }
       stickToBottomRef.current = true;
     });
   }, [timelineItems]);
@@ -1683,9 +2138,10 @@ export default function Home() {
   }
 
   async function handleDeleteConversation(conversationId: string) {
+    setConversationMenuId(null);
     const conversation = conversations.find((item) => item.id === conversationId);
     const confirmed = window.confirm(
-      `删除会话"${conversation?.title ?? "未命名会话"}"？\n\n会同时删除这条会话的生成文件和上传资料。`,
+      `删除会话"${conversationDisplayTitle(conversation)}"？\n\n会同时删除这条会话的生成文件和上传资料。`,
     );
     if (!confirmed) {
       return;
@@ -1709,6 +2165,23 @@ export default function Home() {
     }
   }
 
+  async function handleRenameConversation(conversation: Conversation) {
+    setConversationMenuId(null);
+    const title = window.prompt("会话标题", conversationDisplayTitle(conversation))?.trim();
+    if (!title || title === conversation.title) {
+      return;
+    }
+    try {
+      const updated = await updateConversationTitle(conversation.id, title);
+      setConversations((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      conversationsRef.current = conversationsRef.current.map((item) =>
+        item.id === updated.id ? updated : item,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rename conversation");
+    }
+  }
+
   async function handleSend(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeId || !input.trim() || sending || turnBusy) {
@@ -1718,7 +2191,7 @@ export default function Home() {
     const filesToMention = resolveMentionedFiles(content, mentionedFiles, workspaceFiles);
     const now = new Date().toISOString();
     const localMessageId = `local-user-${Date.now()}`;
-    const localStatusEventId = `local-status-${localMessageId}`;
+    const localTurnId = `local-turn-${localMessageId}`;
     setInput("");
     setMentionedFiles([]);
     setSending(true);
@@ -1739,13 +2212,18 @@ export default function Home() {
     ]);
     setEvents((prev) =>
       mergeEvents(prev, [
-        {
-          id: localStatusEventId,
-          conversation_id: activeId,
-          type: "conversation_status",
-          payload: { status: "queued", error: null },
-          created_at: now,
-        },
+        localProcessEvent(activeId, "turn_started", localTurnId, now, {
+          processItem: {
+            id: localTurnId,
+            kind: "reasoning",
+            status: "running",
+            title: "思考中..",
+          },
+        }),
+        localProcessEvent(activeId, "conversation_status", localTurnId, now, {
+          status: "queued",
+          error: null,
+        }),
       ]),
     );
     try {
@@ -1762,9 +2240,43 @@ export default function Home() {
             : message,
         ),
       );
+      setTurns((prev) => [
+        ...prev.filter((turn) => turn.id !== response.turn.id),
+        response.turn,
+      ]);
+      activeStatusRef.current = response.conversation.status;
+      setConversations((prev) =>
+        prev.map((conversation) =>
+          conversation.id === response.conversation.id ? response.conversation : conversation,
+        ),
+      );
+      conversationsRef.current = conversationsRef.current.map((conversation) =>
+        conversation.id === response.conversation.id ? response.conversation : conversation,
+      );
+      setEvents((prev) =>
+        mergeEvents(
+          prev.filter((eventItem) => !eventItem.id?.startsWith(`local-`) || !eventItem.id.includes(localTurnId)),
+          [
+            localProcessEvent(activeId, "turn_started", response.turn.id, response.turn.started_at ?? now, {
+              processItem: {
+                id: response.turn.id,
+                kind: "reasoning",
+                status: "running",
+                title: "思考中..",
+              },
+            }),
+            localProcessEvent(activeId, "conversation_status", response.turn.id, response.turn.updated_at ?? now, {
+              status: response.turn.status,
+              error: response.turn.error,
+            }),
+          ],
+        ),
+      );
       await refreshConversations();
     } catch (err) {
-      setEvents((prev) => prev.filter((eventItem) => eventItem.id !== localStatusEventId));
+      setEvents((prev) =>
+        prev.filter((eventItem) => !eventItem.id?.startsWith(`local-`) || !eventItem.id.includes(localTurnId)),
+      );
       activeStatusRef.current = "idle";
       setConversations((prev) =>
         prev.map((conversation) =>
@@ -2026,51 +2538,78 @@ export default function Home() {
               加载中
             </div>
           ) : (
-            conversations.map((conversation) => (
-              <div
-                key={conversation.id}
-                className={clsx(
-                  "group mb-2 rounded-md border transition",
-                  conversation.id === activeId
-                    ? "border-ink bg-ink text-white"
-                    : "border-line bg-white hover:bg-panel",
-                )}
-              >
-                <button
-                  type="button"
-                  onClick={() => switchConversation(conversation.id)}
-                  className="w-full px-3 py-3 text-left"
-                >
-                  <div className="line-clamp-2 text-sm font-medium">{conversation.title}</div>
-                  <div
-                    className={clsx(
-                      "mt-2 flex items-center justify-between text-xs",
-                      conversation.id === activeId ? "text-white/70" : "text-muted",
-                    )}
-                  >
-                    <span>{statusLabel[conversation.status] ?? conversation.status}</span>
+            <div className="space-y-1">
+              {conversations.map((conversation) => {
+                const active = conversation.id === activeId;
+                const menuOpen = conversationMenuId === conversation.id;
+                return (
+                  <div key={conversation.id} className="group relative">
+                    <button
+                      type="button"
+                      onClick={() => switchConversation(conversation.id)}
+                      className={clsx(
+                        "flex min-h-[54px] w-full items-center rounded-md px-3 py-2.5 pr-11 text-left transition",
+                        active ? "bg-panel text-ink" : "text-ink hover:bg-panel",
+                      )}
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="line-clamp-1 text-sm font-medium">
+                          {conversationDisplayTitle(conversation)}
+                        </span>
+                        <span className="mt-1 block truncate text-xs text-muted">
+                          {statusLabel[conversation.status] ?? conversation.status}
+                        </span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setConversationMenuId((current) =>
+                          current === conversation.id ? null : conversation.id,
+                        );
+                      }}
+                      className={clsx(
+                        "absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-muted opacity-0 transition hover:bg-white hover:text-ink focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-accent/30 group-hover:opacity-100",
+                        menuOpen && "bg-white text-ink opacity-100 shadow-sm",
+                      )}
+                      aria-haspopup="menu"
+                      aria-expanded={menuOpen}
+                      title="会话操作"
+                    >
+                      <MoreHorizontal size={16} />
+                    </button>
+                    {menuOpen ? (
+                      <div
+                        role="menu"
+                        onMouseDown={(event) => event.stopPropagation()}
+                        className="absolute right-2 top-10 z-30 w-36 rounded-md border border-line bg-white p-1 text-sm text-ink shadow-soft"
+                      >
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void handleRenameConversation(conversation)}
+                          className="flex h-9 w-full items-center gap-2 rounded px-2 text-left hover:bg-panel"
+                        >
+                          <Pencil size={14} />
+                          重命名
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void handleDeleteConversation(conversation.id)}
+                          className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-bad hover:bg-bad/10"
+                        >
+                          <Trash2 size={14} />
+                          删除
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
-                </button>
-                <div
-                  className={clsx(
-                    "flex justify-end border-t px-2 py-1",
-                    conversation.id === activeId ? "border-white/10" : "border-line",
-                  )}
-                >
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteConversation(conversation.id)}
-                    className={clsx(
-                      "flex h-7 w-7 items-center justify-center rounded opacity-70 hover:bg-bad/10 hover:text-bad group-hover:opacity-100",
-                      conversation.id === activeId ? "text-white/80" : "text-muted",
-                    )}
-                    title="删除会话"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              </div>
-            ))
+                );
+              })}
+            </div>
           )}
         </div>
         <div className="border-t border-line bg-white p-3">
@@ -2091,8 +2630,20 @@ export default function Home() {
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-line bg-white px-5">
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold">
-              {activeConversation?.title ?? "暂无会话"}
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="truncate text-sm font-semibold">
+                {conversationDisplayTitle(activeConversation)}
+              </div>
+              {activeConversation ? (
+                <button
+                  type="button"
+                  onClick={() => void handleRenameConversation(activeConversation)}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-muted hover:bg-panel hover:text-ink"
+                  title="重命名会话"
+                >
+                  <Pencil size={14} />
+                </button>
+              ) : null}
             </div>
             <div className="mt-0.5 truncate text-xs text-muted">
               {activeWorkspace?.name ?? "暂无工作区"}
@@ -2264,7 +2815,6 @@ function MessageBubble({ message }: { message: LocalMessage }) {
         )}
       >
         <MarkdownContent content={message.content} inverted={isUser} />
-        {message.pending ? <span className="ml-1 inline-block h-2 w-2 animate-pulse rounded-full bg-accent" /> : null}
       </div>
     </div>
   );
@@ -2404,7 +2954,8 @@ function liveProcessDetail(active?: ActiveProcess) {
 }
 
 function visibleProcessSteps(group: ProcessGroup) {
-  return group.steps
+  return [...group.steps]
+    .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
     .filter((step) => step.kind !== "result" || group.status !== "running")
     .slice(group.status === "running" ? -6 : -10);
 }
@@ -2593,7 +3144,10 @@ function processIconFor(
   if (kind === "file") {
     return <FileText size={14} />;
   }
-  if (kind === "reasoning" || kind === "network") {
+  if (kind === "image") {
+    return <Sparkles size={14} />;
+  }
+  if (kind === "reasoning" || kind === "network" || kind === "tool") {
     return <Wrench size={14} />;
   }
   return <CheckCircle2 className="text-good" size={14} />;

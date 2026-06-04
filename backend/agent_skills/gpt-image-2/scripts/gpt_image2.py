@@ -19,7 +19,7 @@ DEFAULT_API_KEY = (
 DEFAULT_GENERATE_PATH = os.environ.get("GPT_IMAGE2_GENERATE_PATH", "/v1/images/generations")
 DEFAULT_EDIT_PATH = os.environ.get("GPT_IMAGE2_EDIT_PATH", "/v1/images/edits")
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_TIMEOUT = int(os.environ.get("GPT_IMAGE2_TIMEOUT_SECONDS", "620"))
+DEFAULT_TIMEOUT = int(os.environ.get("GPT_IMAGE2_TIMEOUT_SECONDS", "3600"))
 
 QUALITIES = ("low", "medium", "high", "auto")
 FORMATS = ("png", "jpeg", "webp")
