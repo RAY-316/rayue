@@ -232,6 +232,25 @@ class WorkspaceFile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class GrokGeneration(Base):
+    __tablename__ = "grok_generations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("grok"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(24))
+    status: Mapped[str] = mapped_column(String(40), default="queued")
+    model: Mapped[str] = mapped_column(String(120))
+    prompt: Mapped[str] = mapped_column(Text)
+    params: Mapped[dict] = mapped_column(JSONB, default=dict)
+    outputs: Mapped[list] = mapped_column(JSONB, default=list)
+    provider_request_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 Index("ix_messages_conversation_created", Message.conversation_id, Message.created_at)
 Index("ix_users_email", User.email)
 Index("ix_user_sessions_user", UserSession.user_id)
@@ -251,3 +270,5 @@ Index("ix_artifact_records_workspace_path", ArtifactRecord.workspace_id, Artifac
 Index("ix_artifact_records_turn", ArtifactRecord.turn_id)
 Index("ix_workspace_files_workspace_path", WorkspaceFile.workspace_id, WorkspaceFile.relative_path, unique=True)
 Index("ix_workspace_files_workspace_kind", WorkspaceFile.workspace_id, WorkspaceFile.kind)
+Index("ix_grok_generations_user_created", GrokGeneration.user_id, GrokGeneration.created_at)
+Index("ix_grok_generations_user_status", GrokGeneration.user_id, GrokGeneration.status)

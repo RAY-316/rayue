@@ -179,6 +179,40 @@ export type UploadedFile = {
   modified_at: string | null;
 };
 
+export type GrokOutput = {
+  name: string;
+  path: string;
+  media_type: string;
+  size: number;
+  url: string;
+  width?: number | null;
+  height?: number | null;
+  duration?: number | null;
+};
+
+export type GrokGeneration = {
+  id: string;
+  kind: "image" | "video" | string;
+  status: "queued" | "running" | "succeeded" | "failed" | string;
+  model: string;
+  prompt: string;
+  params: Record<string, unknown>;
+  outputs: GrokOutput[];
+  provider_request_id: string | null;
+  error: string | null;
+  usage: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
+export type GrokGenerationList = {
+  items: GrokGeneration[];
+  page: number;
+  page_size: number;
+  total: number;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -411,4 +445,171 @@ export async function uploadFiles(conversationId: string, files: FileList | File
 
 export function conversationEventsUrl(conversationId: string) {
   return appendToken(`${getApiBase()}/api/conversations/${conversationId}/events`);
+}
+
+export function listGrokGenerations(kind = "all", page = 1, pageSize = 20, status?: string) {
+  const statusQuery = status ? `&status=${encodeURIComponent(status)}` : "";
+  return request<GrokGenerationList>(
+    `/api/grok/generations?kind=${encodeURIComponent(kind)}&page=${page}&page_size=${pageSize}${statusQuery}`,
+  );
+}
+
+export function generateGrokImage(input: {
+  prompt: string;
+  model: string;
+  n: number;
+  aspect_ratio: string;
+  resolution: string;
+  size?: string;
+}) {
+  return request<GrokGeneration>("/api/grok/images/generations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function editGrokImage(input: {
+  prompt: string;
+  model: string;
+  n: number;
+  aspect_ratio: string;
+  resolution: string;
+  size?: string;
+  imageUrls?: string;
+  sourceRefs?: string[];
+  images?: File[];
+}) {
+  const form = new FormData();
+  form.set("prompt", input.prompt);
+  form.set("model", input.model);
+  form.set("n", String(input.n));
+  form.set("aspect_ratio", input.aspect_ratio);
+  form.set("resolution", input.resolution);
+  if (input.size) {
+    form.set("size", input.size);
+  }
+  if (input.imageUrls) {
+    form.set("image_urls", input.imageUrls);
+  }
+  if (input.sourceRefs?.length) {
+    form.set("source_refs", input.sourceRefs.join("\n"));
+  }
+  for (const image of input.images ?? []) {
+    form.append("images", image);
+  }
+  const response = await fetch(`${getApiBase()}/api/grok/images/edits`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  return response.json() as Promise<GrokGeneration>;
+}
+
+export async function createGrokVideo(input: {
+  prompt: string;
+  mode: string;
+  model: string;
+  seconds: number;
+  duration?: number;
+  aspect_ratio: string;
+  resolution: string;
+  imageUrl?: string;
+  imageUrls?: string;
+  sourceRef?: string;
+  sourceRefs?: string[];
+  images?: File[];
+  videoUrl?: string;
+  videoSourceRef?: string;
+  video?: File | null;
+  mediaManifest?: unknown[];
+}) {
+  const form = new FormData();
+  form.set("prompt", input.prompt);
+  form.set("mode", input.mode);
+  form.set("model", input.model);
+  form.set("seconds", String(input.seconds));
+  if (input.duration) {
+    form.set("duration", String(input.duration));
+  }
+  form.set("aspect_ratio", input.aspect_ratio);
+  form.set("resolution", input.resolution);
+  if (input.imageUrl) {
+    form.set("image_url", input.imageUrl);
+  }
+  if (input.imageUrls) {
+    form.set("image_urls", input.imageUrls);
+  }
+  if (input.sourceRef) {
+    form.set("source_ref", input.sourceRef);
+  }
+  if (input.sourceRefs?.length) {
+    form.set("source_refs", input.sourceRefs.join("\n"));
+  }
+  if (input.videoUrl) {
+    form.set("video_url", input.videoUrl);
+  }
+  if (input.videoSourceRef) {
+    form.set("video_source_ref", input.videoSourceRef);
+  }
+  if (input.mediaManifest?.length) {
+    form.set("media_manifest", JSON.stringify(input.mediaManifest));
+  }
+  for (const image of input.images ?? []) {
+    form.append("images", image);
+  }
+  if (input.video) {
+    form.set("video", input.video);
+  }
+  const response = await fetch(`${getApiBase()}/api/grok/videos`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  return response.json() as Promise<GrokGeneration>;
+}
+
+export async function createTalkingPhoto(input: {
+  prompt?: string;
+  image: File;
+  audio: File;
+}) {
+  const form = new FormData();
+  form.set("prompt", input.prompt?.trim() || "");
+  form.set("image", input.image);
+  form.set("audio", input.audio);
+  const response = await fetch(`${getApiBase()}/api/grok/talking-photo`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  return response.json() as Promise<GrokGeneration>;
+}
+
+export async function deleteGrokGeneration(id: string) {
+  const response = await fetch(`${getApiBase()}/api/grok/generations/${id}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+}
+
+export function refreshGrokGeneration(id: string) {
+  return request<GrokGeneration>(`/api/grok/generations/${id}/refresh`, {
+    method: "POST",
+  });
+}
+
+export function grokDownloadUrl(id: string, index = 0) {
+  return appendToken(`${getApiBase()}/api/grok/generations/${id}/download?index=${index}`);
 }

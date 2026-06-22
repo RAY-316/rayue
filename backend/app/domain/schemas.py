@@ -225,6 +225,60 @@ class WorkspaceFileOut(BaseModel):
     modified_at: datetime | None
 
 
+class GrokOutputOut(BaseModel):
+    name: str
+    path: str
+    media_type: str
+    size: int
+    url: str
+    width: int | None = None
+    height: int | None = None
+    duration: float | None = None
+
+
+class GrokGenerationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    kind: str
+    status: str
+    model: str
+    prompt: str
+    params: dict
+    outputs: list[GrokOutputOut] = Field(default_factory=list)
+    provider_request_id: str | None
+    error: str | None
+    usage: dict | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class GrokGenerationListOut(BaseModel):
+    items: list[GrokGenerationOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class GrokImageGenerateRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str = "gpt-image-2"
+    n: int = Field(default=1, ge=1, le=4)
+    aspect_ratio: str = "1:1"
+    resolution: str = "1k"
+    size: str = "auto"
+
+
+class GrokVideoRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str = "grok-imagine-video"
+    seconds: int = Field(default=4, ge=1, le=15)
+    aspect_ratio: str = "16:9"
+    resolution: str = "480p"
+    image_url: str | None = None
+
+
 class FileMentionRequest(BaseModel):
     file_id: str | None = None
     relative_path: str | None = None

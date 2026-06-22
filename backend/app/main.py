@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import artifacts
 from app.api import auth
 from app.api import conversations
+from app.api import grok
 from app.api import health
 from app.api import uploads
 from app.api import workspaces
@@ -29,6 +30,7 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(workspaces.router)
 app.include_router(conversations.router)
+app.include_router(grok.router)
 app.include_router(artifacts.router)
 app.include_router(uploads.router)
 app.include_router(convertx_router)
